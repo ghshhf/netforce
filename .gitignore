@@ -7,6 +7,13 @@ _visited.json
 _visited.db
 _visited.db-shm
 _visited.db-wal
+# 采集内核的运行状态：库/队列/分类结果，都是可再生成的产物，入库只会越滚越大
+_skynet.db
+_skynet.db-shm
+_skynet.db-wal
+_last_launch
+classified.json
+queue.json
 _*.json
 *.jsonl
 *.log
