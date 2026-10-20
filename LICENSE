@@ -1,0 +1,47 @@
+Netforce Non-Commercial License 1.0
+Netforce 禁止商用许可 1.0
+Copyright (c) 2026 ghshhf
+
+一句话：随便用、随便改、随便传，但禁止任何商业用途。
+In one line: use it, fork it, share it freely — commercial use is prohibited.
+
+────────────────────────────────────────────────────────
+一、允许
+
+  1. 个人学习、研究、教学、非营利项目：允许，无需申请。
+  2. 修改、二次开发、再分发（含修改后的版本）：允许。
+
+二、禁止
+
+  任何以营利为目的的使用，包括但不限于：
+
+  1. 出售本软件或其修改版；
+  2. 作为收费产品或收费服务的组成部分（含随硬件搭售）；
+  3. 部署为对外收费的 SaaS、API 或数据服务；
+  4. 用于商业主体的生产环境；
+  5. 用于生产用于销售的模型、数据集或其衍生品；
+  6. 任何形式的商业再授权。
+
+三、保留声明
+
+  分发本软件或其修改版时，必须保留本许可全文与上述版权声明；
+  修改版须注明已作改动。
+
+四、无担保
+
+  本软件按"现状"提供，不附带任何明示或暗示的担保，包括但不限于对
+  适销性、特定用途适用性和非侵权性的担保。使用本软件造成的任何直接
+  或间接损失，作者不承担责任。爬取他人站点时，请自行遵守目标站点的
+  robots.txt、服务条款与所在地法律。
+
+五、商业授权
+
+  如需商业用途，须另行取得作者书面许可。
+
+────────────────────────────────────────────────────────
+Non-binding English summary: Permission is granted to use, modify and
+redistribute this software for any NON-COMMERCIAL purpose, provided this
+license and copyright notice are retained. Any commercial use, including
+selling, paid services, paid SaaS/API deployment, or use in a commercial
+production environment, requires prior written permission from the author.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

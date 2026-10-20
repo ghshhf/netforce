@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+# 抓取产出与运行状态：体积大且含第三方站点，不入库
+resources.json
+_visited.json
+_visited.db
+_visited.db-shm
+_visited.db-wal
+_*.json
+*.jsonl
+*.log
+*.arrow
+*_backup_*
+
+# 备份与临时
+*.bak_*
+*.tmp
+*~
+
+# 报告类中间产物
+resources_by_category.md
+problems_batch.md
