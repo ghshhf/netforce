@@ -945,6 +945,35 @@ def _curl_get(url, timeout=6):
     return ""
 
 
+# ---- GitHub raw 镜像兜底 ----
+# raw.githubusercontent.com 在国内会**整段连接重置**（不是 404）。这种失败换 UA、
+# 换通道、开无头浏览器都救不回来，只能换主机名。
+#
+# 为什么必须单独补这一层：SEEDS 里 24 个种子全指向 raw 域名。一旦它被墙，日志里
+# 只会显示「24 个种子全部失败」，看起来像链接全部失效，实际是域名不通——会把排查
+# 方向带偏（2026-10-21 装 Nous Hermes 时就是在这上面连废四次，而同一时刻
+# api.github.com / codeload.github.com / cdn.jsdelivr.net 全通）。
+#
+# 只用纯 CDN：jsdelivr / statically 直接读仓库内容，本身不做中转。
+# 🔴 不挂 gh-proxy 这类反代——本机已有代理，再套一层只慢不快，且反代自身不稳定。
+_RAW_RE = re.compile(
+    r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$", re.I)
+
+
+def _raw_mirrors(url):
+    """GitHub raw → 等价 CDN 地址列表；非 raw 地址返回空（表示无镜像可换）。
+
+    代价：CDN 有缓存（jsdelivr 约 12h），刚 push 的内容可能滞后。所以它只做兜底，
+    绝不替代原站。
+    """
+    m = _RAW_RE.match(url)
+    if not m:
+        return []
+    u, r, ref, p = m.groups()
+    return [f"https://cdn.jsdelivr.net/gh/{u}/{r}@{ref}/{p}",
+            f"https://cdn.statically.io/gh/{u}/{r}/{ref}/{p}"]
+
+
 def fetch(url, timeout=4):
     for op in _openers():
         try:
@@ -956,6 +985,19 @@ def fetch(url, timeout=4):
     h = _curl_get(url, timeout)           # urllib 全灭 → curl_cffi 伪装 → 系统 curl
     if h:
         return h
+    # 第三级：换域名。原始主机整段不通时，这是唯一还通的路径（且比开浏览器轻得多）。
+    for alt in _raw_mirrors(url):
+        h = _curl_get(alt, timeout)
+        if h:
+            return h
+        try:
+            req = urllib.request.Request(
+                alt, headers={"User-Agent": "Mozilla/5.0 netforce-finder"})
+            h = _opener().open(req, timeout=timeout).read().decode("utf-8", "ignore")
+            if h:
+                return h
+        except Exception:
+            continue
     return _browser_get(url)              # 第四级兜底：无头浏览器渲染（JS 站/人机校验）
 
 
