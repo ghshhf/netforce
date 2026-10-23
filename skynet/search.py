@@ -39,6 +39,20 @@ JUNK_HOST = re.compile(
     r"dictionary\.|cambridge|openrice|centanet)", re.I)
 BAD_EXT = re.compile(r"\.(png|jpe?g|gif|svg|ico|css|js|woff2?|ttf|zip|exe|dmg|mp3|mp4)$", re.I)
 
+# ---------------------------------------------------------- 标题长度闸门
+# 实测事故（2026-10-23）：搜中文热门词时，一批刷屏仓库把**整篇文章**写进
+# GitHub repo 的 description（不是仓库内容，是 description 字段），
+# 一条 title 就有 5.9 万字。下游把它喂给手机上的小模型，一次搜索 31 万字，
+# 直接撑爆 4096 上下文（llama-server 返回 400）。
+#
+# 正常网页标题 < 120 字，GitHub 正常仓库描述 < 350 字。所以：
+#   TITLE_TRUST —— 这个长度以内视为「真标题」，可信
+#   TITLE_MAX   —— 超过就截断，绝不整段往下游传
+# 这两个数不是审美，是「下游上下文预算」的硬边界。
+TITLE_TRUST = 120
+TITLE_MAX = 300
+GITHUB_DESC_MAX = 350
+
 
 def canon(u: str) -> str:
     try:
@@ -204,12 +218,22 @@ def engine_searx(q: str) -> list[tuple[str, str]]:
 
 
 def engine_github(q: str) -> list[tuple[str, str]]:
-    """GitHub 仓库搜索 API —— 结构化、稳定，找「项目/清单」类命中率最高。"""
+    """GitHub 仓库搜索 API —— 结构化、稳定，找「项目/清单」类命中率最高。
+
+    ⚠ 刷屏仓库：有批仓库把整篇长文塞进 **description**（不是仓库内容），
+      按 star 排序时会排到最前。正常仓库描述 < 350 字，所以这里**整个丢掉**
+      超长描述，不做截断 —— 截断只会留下同样没用的开头，还把这个事实藏起来。
+    """
     u = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
         {"q": q, "sort": "stars", "per_page": "20"})
     d = net.fetch_json(u, timeout=10, budget=12, gap=0.2)
-    return [(it["html_url"], f"{it.get('full_name','')} {it.get('description') or ''}")
-            for it in (d.get("items") or [])]
+    out: list[tuple[str, str]] = []
+    for it in (d.get("items") or []):
+        desc = (it.get("description") or "").strip()
+        if len(desc) > GITHUB_DESC_MAX:
+            continue
+        out.append((it["html_url"], f"{it.get('full_name','')} {desc}".strip()))
+    return out
 
 
 def engine_mediawiki(q: str, tag: str = "blhx") -> list[tuple[str, str]]:
@@ -357,8 +381,15 @@ def search(query: str, wiki_tag: Optional[str] = None,
             if rel < min_rel:
                 continue
             kept += 1
+            # 存之前先截：任何引擎都不许把几万字塞进标题（见 TITLE_MAX 注释）
+            title = title.strip()[:TITLE_MAX]
             d = raw.setdefault(k, {"title": title, "engines": [], "rel": rel})
-            if len(title) > len(d["title"]):
+            # 合并时**不能取最长**：刷屏页的 title 动辄几万字，取最长等于让它
+            # 必然胜出、把正常引擎的好标题顶掉。规则改成
+            # 「当前还是短标题(可信)、新标题更长但仍在合理范围」才替换。
+            cur = d["title"]
+            if (len(title) > len(cur) and len(cur) <= TITLE_TRUST
+                    and len(title) <= TITLE_TRUST):
                 d["title"] = title
             d["rel"] = max(d["rel"], rel)
             if e not in d["engines"]:
