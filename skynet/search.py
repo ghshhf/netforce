@@ -53,6 +53,12 @@ TITLE_TRUST = 120
 TITLE_MAX = 300
 GITHUB_DESC_MAX = 350
 
+# 摘要（搜索引擎给的 description / snippet）上限。摘要是**广告话术最密集
+# 的一段**（「首存送」「点击进入」全在这儿），过去整层丢弃等于把最强的
+# 身份证据扔了；但也不能无限长——和标题同一个量级，受同一个下游预算管。
+DESC_MAX = 240
+DESC_TRUST = 160
+
 
 def canon(u: str) -> str:
     try:
@@ -115,6 +121,7 @@ class Hit:
     url: str
     host: str
     title: str = ""
+    desc: str = ""
     engines: list = field(default_factory=list)
     rel: float = 0.0
     score: float = 0.0
@@ -129,18 +136,25 @@ class Hit:
 
 
 # ---------------------------------------------------------------- 引擎实现
-def _rss_items(html: str) -> list[tuple[str, str]]:
-    """RSS/Atom → [(url, title)]。严格只取 item 内 link+title，不碰页面其他链接。"""
+def _rss_items(html: str) -> list[tuple[str, str, str]]:
+    """RSS/Atom → [(url, title, desc)]。严格只取 item 内 link+title。
+
+    desc 取 item 的 `<description>`——**这是广告话术最密集的字段**
+    （导流词、品类词全在摘要里，标题反而常被磨成关键词串）。过去整个
+    丢弃，下游只能看标题猜，等于自废一半证据。洗法：剥标签 → 截 DESC_MAX。"""
     out = []
     for it in re.findall(r"<item[^>]*>(.*?)</item>", html, re.S | re.I):
         m = re.search(r"<link[^>]*>(.*?)</link>", it, re.S | re.I)
         t = re.search(r"<title[^>]*>(.*?)</title>", it, re.S | re.I)
+        d = re.search(r"<description[^>]*>(.*?)</description>", it, re.S | re.I)
         if not m:
             continue
         u = re.sub(r"<!\[CDATA\[|\]\]>", "", m.group(1)).strip()
         ti = re.sub(r"<!\[CDATA\[|\]\]>", "", t.group(1)).strip() if t else ""
+        de = re.sub(r"<[^>]+>", " ", d.group(1)) if d else ""
+        de = _unesc(re.sub(r"<!\[CDATA\[|\]\]>", "", de))[:DESC_MAX]
         if u.startswith("http"):
-            out.append((u, _unesc(ti)))
+            out.append((u, _unesc(ti), de))
     return out
 
 
@@ -150,14 +164,18 @@ def _unesc(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def engine_bing(q: str) -> list[tuple[str, str]]:
+def engine_bing(q: str) -> list[tuple[str, str, str]]:
     u = "https://www.bing.com/search?q=" + urllib.parse.quote(q) + "&format=rss&count=50"
     r = net.fetch_text(u, timeout=15, budget=15)
     return _rss_items(r.text) if r.ok else []
 
 
-def engine_ddg(q: str) -> list[tuple[str, str]]:
-    """DDG html 端必须 POST。链接在 result__a 的 href，实际地址藏在 uddg 参数里。"""
+def engine_ddg(q: str) -> list[tuple[str, str, str]]:
+    """DDG html 端必须 POST。链接在 result__a 的 href，实际地址藏在 uddg 参数里。
+
+    摘要在同一结果块的 `result__snippet` 里。做法：按 result__a 切块，
+    在块内向后找 snippet——不整页正则（会跨结果块错配）。
+    """
     body = urllib.parse.urlencode({"q": q}).encode()
     req = net.urllib.request.Request(
         "https://html.duckduckgo.com/html/", data=body,
@@ -180,8 +198,13 @@ def engine_ddg(q: str) -> list[tuple[str, str]]:
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
             href = (qs.get("uddg") or [href])[0]
         href = _unesc(href)
-        if href.startswith("http"):
-            out.append((href, _unesc(re.sub(r"<[^>]+>", "", txt))))
+        if not href.startswith("http"):
+            continue
+        seg = html[m.end():m.end() + 3000]
+        sm = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
+                       seg, re.S | re.I)
+        snip = _unesc(re.sub(r"<[^>]+>", " ", sm.group(1)))[:DESC_MAX] if sm else ""
+        out.append((href, _unesc(re.sub(r"<[^>]+>", "", txt)), snip))
     return out
 
 
@@ -190,11 +213,11 @@ SEARX_HOSTS = ["https://searx.be", "https://searxng.site", "https://search.bus-h
 _SEARX_OK: Optional[str] = None
 
 
-def engine_searx(q: str) -> list[tuple[str, str]]:
+def engine_searx(q: str) -> list[tuple[str, str, str]]:
     """SearXNG JSON 端：结构化最干净，有 title+url，天然适配意图校验。
 
     5 个实例**并发**探测（串行要 70s，并发最慢也只有一个 timeout），
-    探到能用的就记住，这轮之后都不再重复试错。
+    探到能用的就记住，这轮之后都不再重复试错。摘要取 JSON 的 `content` 字段。
     """
     global _SEARX_OK
     hosts = [_SEARX_OK] if _SEARX_OK else SEARX_HOSTS
@@ -203,7 +226,9 @@ def engine_searx(q: str) -> list[tuple[str, str]]:
         u = f"{h}/search?" + urllib.parse.urlencode(
             {"q": q, "format": "json", "safesearch": "0", "language": "all"})
         d = net.fetch_json(u, timeout=10, budget=12, gap=0.2)
-        res = [(it["url"], it.get("title") or "") for it in (d.get("results") or [])[:40]
+        res = [(it["url"], it.get("title") or "",
+                (it.get("content") or "")[:DESC_MAX])
+               for it in (d.get("results") or [])[:40]
                if it.get("url")]
         return h, res
 
@@ -217,27 +242,33 @@ def engine_searx(q: str) -> list[tuple[str, str]]:
     return []
 
 
-def engine_github(q: str) -> list[tuple[str, str]]:
+def engine_github(q: str) -> list[tuple[str, str, str]]:
     """GitHub 仓库搜索 API —— 结构化、稳定，找「项目/清单」类命中率最高。
 
     ⚠ 刷屏仓库：有批仓库把整篇长文塞进 **description**（不是仓库内容），
       按 star 排序时会排到最前。正常仓库描述 < 350 字，所以这里**整个丢掉**
       超长描述，不做截断 —— 截断只会留下同样没用的开头，还把这个事实藏起来。
-    """
+
+    title 仍是「full_name + desc」的拼接（下游按标题做关键词匹配，
+    拼上是故意的）；desc 单独给一份原文，让下游能区分
+    「仓库名自曝」和「描述自曝」——寄生 SEO 的形状全在后者。"""
     u = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
         {"q": q, "sort": "stars", "per_page": "20"})
     d = net.fetch_json(u, timeout=10, budget=12, gap=0.2)
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for it in (d.get("items") or []):
         desc = (it.get("description") or "").strip()
         if len(desc) > GITHUB_DESC_MAX:
             continue
-        out.append((it["html_url"], f"{it.get('full_name','')} {desc}".strip()))
+        out.append((it["html_url"], f"{it.get('full_name','')} {desc}".strip(),
+                    desc[:DESC_MAX]))
     return out
 
 
-def engine_mediawiki(q: str, tag: str = "blhx") -> list[tuple[str, str]]:
-    """站内搜索：MediaWiki list=search。找「某站里的哪一页」用它，别用网搜。"""
+def engine_mediawiki(q: str, tag: str = "blhx") -> list[tuple[str, str, str]]:
+    """站内搜索：MediaWiki list=search。找「某站里的哪一页」用它，别用网搜。
+
+    摘要取 API 的 `snippet` 字段（自带 <span class=\"searchmatch\"> 高亮，剥掉）。"""
     base = f"https://wiki.biligame.com/{tag}/"
     u = base + "api.php?" + urllib.parse.urlencode(
         {"action": "query", "list": "search", "srsearch": q, "srlimit": "50",
@@ -247,8 +278,10 @@ def engine_mediawiki(q: str, tag: str = "blhx") -> list[tuple[str, str]]:
     for it in d.get("query", {}).get("search", []):
         title = it.get("title", "")
         if title:
+            snip = re.sub(r"<[^>]+>", "", it.get("snippet") or "")
             out.append((base + urllib.parse.quote(title.replace(" ", "_")),
-                        title.replace("<", " ").replace(">", " ")))
+                        title.replace("<", " ").replace(">", " "),
+                        _unesc(snip)[:DESC_MAX]))
     return out
 
 
@@ -369,7 +402,7 @@ def search(query: str, wiki_tag: Optional[str] = None,
     for e, items in results:
         seen = 0
         kept = 0
-        for url, title in items:
+        for url, title, desc in items:
             k = canon(url)
             if not k:
                 continue
@@ -383,7 +416,9 @@ def search(query: str, wiki_tag: Optional[str] = None,
             kept += 1
             # 存之前先截：任何引擎都不许把几万字塞进标题（见 TITLE_MAX 注释）
             title = title.strip()[:TITLE_MAX]
-            d = raw.setdefault(k, {"title": title, "engines": [], "rel": rel})
+            desc = (desc or "").strip()[:DESC_MAX]
+            d = raw.setdefault(k, {"title": title, "desc": desc,
+                                   "engines": [], "rel": rel})
             # 合并时**不能取最长**：刷屏页的 title 动辄几万字，取最长等于让它
             # 必然胜出、把正常引擎的好标题顶掉。规则改成
             # 「当前还是短标题(可信)、新标题更长但仍在合理范围」才替换。
@@ -391,6 +426,11 @@ def search(query: str, wiki_tag: Optional[str] = None,
             if (len(title) > len(cur) and len(cur) <= TITLE_TRUST
                     and len(title) <= TITLE_TRUST):
                 d["title"] = title
+            # 摘要同理：多引擎给同一条时取信息量最大的（仍在 DESC_TRUST 内）。
+            # 摘要是广告话术的栖息地，丢了它下游只剩标题可看。
+            if len(desc) > len(d["desc"]) and len(d["desc"]) <= DESC_TRUST \
+                    and len(desc) <= DESC_TRUST:
+                d["desc"] = desc
             d["rel"] = max(d["rel"], rel)
             if e not in d["engines"]:
                 d["engines"].append(e)
@@ -400,7 +440,8 @@ def search(query: str, wiki_tag: Optional[str] = None,
     for k, d in raw.items():
         base = sum(e.weight * health_weight(e.name, lang) for e in d["engines"])
         cross = 0.4 * (len(d["engines"]) - 1) if len(d["engines"]) > 1 else 0.0
-        hits.append(Hit(url=k, host=host_of(k), title=d["title"], engines=[e.name for e in d["engines"]],
+        hits.append(Hit(url=k, host=host_of(k), title=d["title"], desc=d.get("desc", ""),
+                        engines=[e.name for e in d["engines"]],
                         rel=d["rel"], score=round(base * (0.5 + d["rel"]) + cross, 2)))
     hits.sort(key=lambda h: -h.score)
     return hits
