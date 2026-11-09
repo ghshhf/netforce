@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -241,6 +242,77 @@ def cmd_structure(a):
     return 0
 
 
+def cmd_reverse(a):
+    """转发到 reverse.py。
+
+    参数以 `reverse.py` 自己的 parser 为准（它才是那一层的单一事实源），
+    这里只是把主 CLI 的开关翻译过去 —— 两边定义重复是有意的，
+    真要改参数请改 reverse.py，别在这边另立一套。
+    """
+    from skynet import reverse as rmod
+    g = lambda k, d=None: getattr(a, k, d)          # noqa: E731 防御式取参
+
+    if g("register"):
+        if "=" not in g("register"):
+            print("格式：`--register 命令=完整路径`")
+            return 2
+        cmd, path = g("register").split("=", 1)
+        r = rmod.register_tool(a.out, cmd.strip(), path.strip())
+        print(json.dumps(r, ensure_ascii=False, indent=2) if a.json else r)
+        return 0 if r.get("ok") else 2
+
+    if g("tools"):
+        idx = rmod.tool_index(a.out, refresh=True)
+        if a.json:
+            print(json.dumps(idx, ensure_ascii=False, indent=2))
+        else:
+            print(f"生成于 {idx['generated']}")
+            for c, m in idx["have"].items():
+                tag = "手工登记" if m.get("source") == "manual" else m["version"][:28]
+                print(f"  ✅ {c:12s} {tag:28s} {m['capability']}")
+            for m in idx["missing"]:
+                print(f"  ❌ {m['cmd']:12s} 未安装 —— {m['capability']}")
+        return 0
+
+    if g("journal_find"):
+        hits = rmod.journal_search(a.out, g("journal_find"))
+        print(f"索引命中 {len(hits)} 条：")
+        for h in hits:
+            print("   ", h)
+        return 0
+
+    if g("journal"):
+        parts = [x.strip() for x in g("journal").split("|")]
+        if len(parts) < 3:
+            print("格式：`触发类别|场景|摘要`")
+            return 2
+        r = rmod.journal_write(a.out, parts[0], parts[1], parts[2], target=g("target") or "")
+        print(json.dumps(r, ensure_ascii=False, indent=2) if a.json else r)
+        return 0 if r.get("ok") else 2
+
+    if not g("target"):
+        print("缺少 target（--tools / --journal-find 除外）")
+        return 2
+
+    if g("diff"):
+        r = rmod.diff_versions(a.target, g("diff"), out_dir=a.out)
+    elif g("route_only"):
+        r = rmod.route(a.target, g("intent", "overview"), a.out)
+        r["tools_on_box"] = sorted(rmod.tool_index(a.out).get("have", {}))
+    else:
+        r = rmod.scan(a.target, a.kind, a.out, intent=g("intent", "overview"),
+                      use_snapshot=not g("no_snapshot", False),
+                      frames=a.frames, limit=a.limit, max_strings=a.max_strings,
+                      expose_creds=g("secrets", False))
+
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0 if r.get("kind") != "refused" else 2
+    rmod._print(r, a.show)                            # noqa: SLF001
+    return 0 if r.get("kind") != "refused" else 2
+    return 0 if r.get("kind") != "refused" else 2
+
+
 def main():
     ap = argparse.ArgumentParser(prog="skynet", description="天网采集内核")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -286,6 +358,28 @@ def main():
     p.add_argument("--ext", default="", help="扩展名过滤，逗号分隔；默认音视频")
     p.add_argument("--apply", action="store_true", help="真做成硬链接（路径全保留）")
     p.set_defaults(fn=cmd_dedupe)
+
+    p = sub.add_parser("reverse", help="逆向层：藏着什么（先路由，后动手，结论带证据）")
+    p.add_argument("target", nargs="?", help="URL / 文件路径 / 视频链接")
+    p.add_argument("--kind", default="auto", choices=["auto", "web", "bin", "video"])
+    p.add_argument("--intent", default="overview",
+                   help="意图轴：overview/endpoints/strings/symbols/diff/timeline/flow/source")
+    p.add_argument("--out", default=None, help="产物目录（默认 reverse_out/）")
+    p.add_argument("--frames", type=int, default=6, help="无字幕时最多抽几帧")
+    p.add_argument("--max-strings", type=int, default=400)
+    p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--show", type=int, default=12, help="每类最多打印几条")
+    p.add_argument("--route-only", action="store_true", help="只路由不干活")
+    p.add_argument("--secrets", action="store_true",
+                   help="疑似凭据给值（默认只报几处、什么类型）")
+    p.add_argument("--tools", action="store_true", help="本机工具台账并退出")
+    p.add_argument("--register", default=None, help="登记 PATH 外工具：cmd=路径")
+    p.add_argument("--diff", default=None, help="与 target 做结构差分：传另一个版本")
+    p.add_argument("--no-snapshot", action="store_true", help="不用缓存，重跑一遍")
+    p.add_argument("--journal", default=None, help="写经验：'触发类别|场景|摘要'")
+    p.add_argument("--journal-find", default=None, help="先查经验索引再动手：关键词")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_reverse)
 
     p = sub.add_parser("retry", help="补抓失败项：页面重探 / 文件续传")
     p.add_argument("--kind", default="", help="audio,probe,text；默认全部")

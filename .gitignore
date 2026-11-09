@@ -28,3 +28,34 @@ _*.json
 # 报告类中间产物
 resources_by_category.md
 problems_batch.md
+
+# 本地知识库 / 断点账本 / 资源成品（2026-11-04 第二轮新增）
+# 原语料 *.jsonl 已由上面的规则覆盖；这里补 SQLite、成品文件与运行标志
+_kb/state.db*
+_kb/kb_index.db*
+_kb/assets.db*
+_kb/assets/
+_kb/browser_ok.json
+_kb/direct_ip.json
+_kb/egress_capability.json
+_kb/direct_fail.txt
+_kb/RELOAD_REQUEST
+_kb/render.lock
+_kb/*.log
+_last_launch_*
+
+# 账号凭据（含 API Key / 密码）—— 绝不入库
+_accounts/
+_cookies/
+_hf_*.json
+
+# 本地运行态 / 一次性部署脚本 / 退役组件（2026-11-09）
+# 公开仓只放可复用的代码；运行数据、凭据说明、验收入口都不入库。
+RELAY_KEYS.md
+_kb/
+_cf/_deploy_worker.py
+_cf/_finish_zone.py
+_cf/_test_*.py
+_cf/_timing.py
+_cf/probe.js
+_cf/relay_proxy.py

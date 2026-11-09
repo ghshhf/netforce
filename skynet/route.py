@@ -246,8 +246,8 @@ class ProxyChain:
     """把 [代理1, 代理2, ...] 串成一条链路，返回可以喂给 urllib 的本地入口。
 
     用法：
-        with ProxyChain(["http://127.0.0.1:3067"]) as pc:
-            opener 走 pc.addr → 3067 → 目标
+        with ProxyChain(["http://127.0.0.1:7890"]) as pc:
+            opener 走 pc.addr → 7890 → 目标
 
     单级时等价于直连代理；多级时自建转发器逐级串接（A→B→C）。
     """

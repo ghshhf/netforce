@@ -279,6 +279,16 @@ def bootstrap_keywords(limit=80, ttl=600, log=print):
         zh.append(core + " " + random.choice(_SUFFIX_ZH))
 
     kw = en + zh
+    # 2026-11-09 第二层：把一部分「搜主题」换成「搜形态」。
+    # 自举词全部来自自己的库 ⇒ S→S 闭合映射；结构查询词搜的是页面长什么样
+    # （filetype: / inurl: / intitle:），会撞到完全不同的站群，属外生信息。
+    try:
+        import external_seeds as _es
+        pats = _es.pattern_queries()
+        take = max(1, int(len(kw) * 0.15)) if kw else len(pats)
+        kw += random.sample(pats, min(take, len(pats)))
+    except Exception:
+        pass
     random.shuffle(kw)
     _KW_CACHE.update(ts=now, kw=kw)
     log("[evolve:boot] 自举出 %d 个查询词（英文短语 %d / 中文 %d），例：%s"

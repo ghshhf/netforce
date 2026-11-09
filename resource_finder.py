@@ -8,7 +8,10 @@ netforce / resource_finder.py
 用户原话："扫描全网...你感觉可能吗？网络多大呀" / "就那几个域名，相当于这种情况下才能掌握真正的互联网资源"。
 
 运行：后台跑到早上 6:00（或集满 100 个即停），结果落 resources.json。
-出网走本机代理 127.0.0.1:3067。
+出网（2026-11-09 关联升级）：默认接天网统一出口 18080（国内直连 / 国外 Worker
+      隧道，由 selfproxy 按 APNIC 归属分流）；把 _netpolicy.json 里的
+      crawler_proxy 留空即一键回滚到纯直连（同时恢复死链快速判定）。
+      NETFORCE_PROXY 环境变量优先；绝不读系统代理 / 本机 7890、3067。
 """
 import urllib.request
 import urllib.parse
@@ -17,18 +20,252 @@ import json
 import time
 import datetime
 import ssl
+import socket
 import subprocess
 import os
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import browser_pick     # 无头浏览器启动实测择优（系统 Chrome 会自退）
+import sys              # 顶部先引进来：无窗口常驻要用（1853 行还有一次，重复 import 无害）
 
-PROXY = os.environ.get("NETFORCE_PROXY", "http://127.0.0.1:3067")   # 置空字符串 = 全程直连
+# pythonw / DETACHED 无控制台时 sys.stdout、sys.stderr 是 None，
+# 任何 print(..., flush=True) 都会抛 AttributeError 直接把进程干掉。
+# 统一重定向到日志，保证后台长期常驻也能写日志、不弹窗。
+if sys.stdout is None or sys.stderr is None:
+    _console_log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "_kb", "resource_finder_console.log")
+    _console_f = open(_console_log, "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = _console_f
+    if sys.stderr is None:
+        sys.stderr = _console_f
+
+
+def _crawler_proxy():
+    """统一出口：环境变量 > _netpolicy.json 的 crawler_proxy > 空(纯直连)。
+
+    关联升级：爬虫不再裸连，默认走 18080 的统一分流。
+    这样 _host_dead() 的直连死链误判自动让路，被墙站点由网络层回落隧道。
+    """
+    if "NETFORCE_PROXY" in os.environ:
+        return os.environ["NETFORCE_PROXY"].strip()
+    try:
+        cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "_netpolicy.json")
+        with open(cfg, encoding="utf-8") as f:
+            return str(json.load(f).get("crawler_proxy") or "").strip()
+    except Exception:
+        return ""
+
+
+PROXY = _crawler_proxy()
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 # 浏览器UA（短链/落地页常有 UA 校验，必须用像样的 UA 才给重定向）
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# ============================================================================
+# 任务层：错峰 / 重试 / 断点续传 / Range / 出口自愈
+# 借鉴 Scrapy AutoThrottle（按实测调并发）、aria2c / hf_hub_download（分片续传）。
+# 全部纯标准库，开关在 _netpolicy.json 的 task_layer，留空即退回旧行为。
+# ============================================================================
+_RF_DIR = os.path.dirname(os.path.abspath(__file__))
+RETRY_FILE = os.path.join(_RF_DIR, "_kb", "retry_queue.jsonl")
+_BOOT_SCRIPT = os.path.join(os.path.dirname(_RF_DIR), "skynet-fleet",
+                            "_boot_network_layer.py")
+_PYW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+
+
+def _task_cfg():
+    """热配置：task_layer 段缺一项就用默认，不重启生效。"""
+    d = {"peak_cap": 20, "offpeak_cap": 40, "retry_max": 3,
+         "range_chunk_mb": 4, "autoheal_egress": True,
+         "external_budget": 0.18, "external_epsilon": 0.18}
+    try:
+        with open(os.path.join(_RF_DIR, "_netpolicy.json"), encoding="utf-8") as f:
+            raw = json.load(f).get("task_layer") or {}
+        for k in d:
+            if k in raw and raw[k] is not None:
+                d[k] = raw[k]
+    except Exception:
+        pass
+    return d
+
+
+def peak_cap():
+    """晚高峰 19:00–23:59 出口最挤 ⇒ 并发减半，把预算留给平峰（错峰队列）。"""
+    try:
+        c = _task_cfg()
+        hr = datetime.datetime.now().hour
+        return int(c["peak_cap"] if 19 <= hr <= 23 else c["offpeak_cap"])
+    except Exception:
+        return 32
+
+
+def peak_backoff():
+    """失败后的退避：晚高峰慢一点，别在堵的时候猛撞。"""
+    hr = datetime.datetime.now().hour
+    return 0.8 if 19 <= hr <= 23 else 0.15
+
+
+def load_retries():
+    """启动时从盘上恢复未完成的重试（断点续传，掉电/重启不丢）。"""
+    q = deque()
+    try:
+        with open(RETRY_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                    n = int(o.get("n") or 1)
+                    if o.get("url") and n <= int(_task_cfg()["retry_max"]):
+                        q.append((float(o.get("due") or 0), o["url"], n))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return q
+
+
+def save_retries(q):
+    """整队列重写（不是无限追加）：成功的重试会从队列里消失，文件不会膨胀。"""
+    try:
+        os.makedirs(os.path.dirname(RETRY_FILE), exist_ok=True)
+        tmp = RETRY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for due, url, n in list(q):
+                f.write(json.dumps({"due": due, "url": url, "n": n},
+                                   ensure_ascii=False) + "\n")
+        os.replace(tmp, RETRY_FILE)
+    except Exception:
+        pass
+
+
+def note_retry(q, url, n, why=""):
+    """fetch 失败不再直接丢 URL：指数退避后重新入队，最多 retry_max 次。"""
+    if n > int(_task_cfg()["retry_max"]):
+        return
+    due = time.time() + min(600, 20 * (2 ** (n - 1)))
+    q.append((due, url, n))
+    save_retries(q)
+
+
+def pop_due_retries(q, limit=20):
+    now, out, rest = time.time(), [], deque()
+    while q:
+        due, url, n = q.popleft()
+        if due <= now:
+            out.append((url, n))
+        else:
+            rest.append((due, url, n))
+    q.extend(rest)
+    return out[:limit]
+
+
+def _egress_port():
+    m = re.search(r"127\.0\.0\.1:(\d+)", PROXY or "")
+    return int(m.group(1)) if m else 0
+
+
+def _egress_alive(port, timeout=0.5):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+_heal_lock = threading.Lock()
+_last_heal = [0.0]
+
+
+def heal_egress():
+    """统一出口掉线 ⇒ 无窗口拉起自启脚本（DETACHED，不建定时任务、不弹窗）。
+
+    2026-11-09 20:17 实测事故：会话切换后 18080 进程没了，爬虫仍按
+    crawler_proxy 发请求，全部 WinError 10061、命中数全 0。靠人盯不现实，
+    所以由爬虫自己守着出口（谁依赖、谁自愈），90 秒内不重复拉起。
+    """
+    port = _egress_port()
+    if not port or not _task_cfg().get("autoheal_egress"):
+        return False
+    if _egress_alive(port):
+        return False
+    with _heal_lock:
+        if time.time() - _last_heal[0] < 90:
+            return False
+        _last_heal[0] = time.time()
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            flags = (subprocess.DETACHED_PROCESS
+                     | subprocess.CREATE_NEW_PROCESS_GROUP
+                     | subprocess.CREATE_NO_WINDOW)
+            cwd = os.path.dirname(_BOOT_SCRIPT)
+            log = open(os.path.join(cwd, "_autostart.log"), "ab", buffering=0)
+            subprocess.Popen([_PYW, _BOOT_SCRIPT], cwd=cwd, creationflags=flags,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             close_fds=True, startupinfo=si)
+            return True
+        except Exception:
+            return False
+
+
+def egress_watchdog():
+    while True:
+        try:
+            if heal_egress():
+                print("[egress] 统一出口掉线，已无窗口拉起自启层", flush=True)
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def resumable_download(url, dest, chunk_mb=None, timeout=15,
+                       max_bytes=200 * 1024 * 1024):
+    """Range 分片 + .part 断点续传下载，返回落盘字节数（0=失败）。
+
+    服务器不支持 Range（返回 200）时自动从头覆盖；支持时逐片追加，
+    中断后下次从 .part 的实际大小继续，绝不重复下载已完成部分。
+    """
+    chunk = int(chunk_mb or _task_cfg()["range_chunk_mb"]) * 1024 * 1024
+    part = dest + ".part"
+    for op in _openers():
+        try:
+            offset = os.path.getsize(part) if os.path.exists(part) else 0
+            total_hint, got = 0, offset
+            while True:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": UA_BROWSER,
+                    "Range": "bytes=%d-%d" % (offset, offset + chunk - 1)})
+                r = op.open(req, timeout=timeout)
+                st = getattr(r, "status", 200) or 200
+                cr = r.headers.get("Content-Range") or ""
+                m = re.search(r"/(\d+)", cr)
+                if m:
+                    total_hint = int(m.group(1))
+                data = r.read()
+                if not data:
+                    break
+                if st == 200 and offset:      # 不支持 Range ⇒ 从 0 重来
+                    offset, got = 0, 0
+                with open(part, "ab" if offset else "wb") as f:
+                    f.write(data)
+                offset += len(data)
+                got = offset
+                if st != 206 or (total_hint and got >= total_hint) or got > max_bytes:
+                    break
+            if got:
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                os.replace(part, dest)
+                return got
+        except Exception:
+            continue
+    return 0
+
 
 # ---- 去重（借鉴 Scrapy 的 dupefilter：请求指纹）----
 # 同一个页面会因为一堆无意义参数变成"不同URL"，不规范化就会重复抓、重复入库。
@@ -49,7 +286,10 @@ def canon(u):
     host = (p.hostname or "").lower()
     if host.startswith("www."):
         host = host[4:]
-    port = p.port
+    try:
+        port = p.port
+    except ValueError:
+        port = None                     # 畸形端口（如 "&quot;https:" 这类 HTML 残片）降级为无端口，不崩整轮
     if port and port not in (80, 443):
         host = "%s:%d" % (host, port)
     path = re.sub(r"/{2,}", "/", p.path or "/")
@@ -95,8 +335,14 @@ class SeenStore:
 
     def __init__(self, path=VISITED_DB):
         import sqlite3
-        self.c = sqlite3.connect(path, check_same_thread=False)
-        self.c.execute("PRAGMA journal_mode=WAL")
+        # timeout = busy_timeout：多进程同时写 seen 库时先等，别直接抛
+        # "database is locked" 把整个长跑爬虫崩掉（2026-11-09 实测事故）。
+        self.c = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+        try:
+            self.c.execute("PRAGMA journal_mode=WAL")   # 读写不互斥
+        except Exception:
+            pass                                       # 别的实例已设好 WAL，忽略
+        self.c.execute("PRAGMA busy_timeout=30000")
         self.c.execute("PRAGMA synchronous=OFF")     # 仅影响去重缓存，丢了下轮重算
         self.c.execute("CREATE TABLE IF NOT EXISTS seen(k TEXT PRIMARY KEY)")
         self.c.commit()
@@ -111,11 +357,19 @@ class SeenStore:
     def add(self, k):
         """True = 首次见到（调用方据此决定要不要处理）。"""
         with self.lock:
-            cur = self.c.execute("INSERT OR IGNORE INTO seen VALUES(?)", (k,))
-            if cur.rowcount:
-                self._n += 1
-                self.c.commit()
-                return True
+            # 锁竞争时短退避重试：爬虫是长跑任务，一次写锁不该终结整个进程。
+            for attempt in range(3):
+                try:
+                    cur = self.c.execute("INSERT OR IGNORE INTO seen VALUES(?)", (k,))
+                    if cur.rowcount:
+                        self._n += 1
+                        self.c.commit()
+                        return True
+                    return False
+                except Exception as e:
+                    if "locked" not in str(e).lower() or attempt == 2:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
             return False
 
     def __len__(self):
@@ -519,8 +773,48 @@ def wiki_pump(kw):
     return out
 
 
+# ---- 网络层死链快速失败（2026-11-05）----
+# fetch() 有四级兜底（urllib → curl_cffi → 系统 curl → 无头浏览器），对整段被墙的
+# 域名，一次调用要耗 15s + 15s + 20s + 浏览器超时 ≈ 1 分钟才返回空。日志实测
+# reddit 泵 89 轮全 0 命中，光这一项就白等一小时以上，且占着自适应并发的轮次。
+# 做法：先做一次 2 秒 TCP 连通判定；判定为死就缓存 TTL，缓存期内直接返回空，
+#      不再触发四级兜底。TTL 到期自动重新试探（网络恢复/开代理后能自己复活）。
+# 🔴 只在直连模式生效；设了 NETFORCE_PROXY 就跳过判定，交给代理链路自己决定。
+_DEAD_HOST = {}        # host -> 判定为死的时刻
+_DEAD_TTL = 1800.0     # 30 分钟后重新试探
+_DEAD_LOCK = threading.Lock()
+
+
+def _host_dead(url, timeout=2.0):
+    """该 URL 的主机在当前网络下是否网络层不可达（带 TTL 缓存）。"""
+    if PROXY:                       # 走代理时不判定，直连探测结果不适用
+        return False
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return False
+    now = time.time()
+    with _DEAD_LOCK:
+        t = _DEAD_HOST.get(host)
+    if t is not None and now - t < _DEAD_TTL:
+        return True
+    alive = True
+    try:
+        with socket.create_connection((host, 443), timeout=timeout):
+            pass
+    except OSError:
+        alive = False
+    with _DEAD_LOCK:
+        if alive:
+            _DEAD_HOST.pop(host, None)
+        else:
+            _DEAD_HOST[host] = now
+    return not alive
+
+
 def reddit_pump(sub):
     u = "https://www.reddit.com/r/%s/top.json?limit=100&t=all" % sub
+    if _host_dead(u):
+        return []
     try:
         return [c["data"]["url"] for c in json.loads(fetch(u, 15)).get("data", {})
                 .get("children", []) if c.get("data", {}).get("url")]
@@ -756,6 +1050,198 @@ def univ_pump(kw):
     return res[:200]
 
 
+# —— 🔴 自建发现层（2026-11-02 加）：不经过搜索引擎的资源发现 ——
+# 搜索引擎只索引「它想索引的那一小部分」，且结果塞满广告。真正的网络有两条
+# 不经过任何搜索公司的公开数据源：① 证书透明度日志（CT Log）② Common Crawl
+# 全网快照。selfindex 泵把它们接进来，搜索引擎降级为「冷启动种子源」。
+# 目标用「类型:值」前缀表达：ct=挖子域、ctkw=按关键词挖域名、ctsfx=按后缀挖域名、
+# ia=互联网档案馆（Wayback）挖存档主机。
+SELFINDEX_TARGETS = [
+    "ct:biligame.com",      # CT 挖二次元站群子域（首页爬不到的冷门子站也能挖）
+    "ct:moegirl.org",       # 萌娘百科子域
+    "ct:archive.org",       # 互联网档案馆子域
+    "ct:github.io",         # GitHub Pages 子域（个人站/项目站富矿）
+    "ct:arena.ai",          # AI agent 平台子域（api/docs/评测等子站）
+    "ctkw:dataset",         # CT 按关键词挖：数据集站（搜索引擎难收录的新站）
+    "ctkw:wiki",
+    "ctkw:download",
+    "ctkw:awesome",
+    "ctkw:tool",
+    "ctkw:resource",
+    "ctkw:open-source",
+    # —— 中国备案域名：境内网站必须 ICP 备案，且备案站都得挂 HTTPS ⇒ 证书全在 CT 日志里。
+    # 这等于绕开备案系统验证码，直接拿到备案域名库（实测 %.cn 一次挖 2665 个）。
+    "ctsfx:cn",             # 中国国家顶级域（含 .com.cn/.net.cn/.gov.cn/.edu.cn）
+    "ctsfx:com.cn",         # 中国商业域名
+    "ctsfx:net.cn",         # 中国网络服务域名
+    "ctsfx:edu.cn",         # 大学站清单（实测一次 1836 个）
+    "ctsfx:ac.cn",          # 科研院所
+    "ctsfx:gov.cn",         # 政府机构
+    "ctsfx:org",
+    "ctsfx:io",
+]
+
+# 云厂商资产测绘泵：现在绝大多数网站都躺在云厂商（阿里云/腾讯云/AWS/Cloudflare）上，
+# 云厂商和测绘引擎早就把全网扫了个遍、公开可查 —— 直接读账本，比爆破快几个量级。
+# 目标用「类型:值」前缀表达：asn=按云厂商 ASN 反查域名、srv=按服务器指纹反查。
+# 实测：asn:Alibaba 一条搜索挖出阿里云名下 30 个真实网站（www.waterconserving.cn 等）。
+CLOUD_TARGETS = [
+    # —— 国内云厂商（按 ASN 反查，一条搜索挖出一片站）——
+    "asn:Alibaba",          # 阿里云（ALIBABA-CN-NET）
+    "asn:Tencent",          # 腾讯云
+    "asn:Huawei",           # 华为云
+    "asn:Baidu",            # 百度云
+    # —— 国外云厂商 / CDN（按 ASN 反查）——
+    "asn:Cloudflare",       # 全球最大 CDN
+    "asn:Amazon",           # AWS
+    "asn:Microsoft",        # Azure
+    "asn:Google",           # GCP
+    "asn:DigitalOcean",
+    # —— 服务器指纹反查（PaaS 层：底层是 AWS/GCP，但 server 字段能细分出来）——
+    #   实测 srv:Vercel 挖出 pms.aiscaling.ai 等真实站、srv:Netlify 挖出 metrocapnyc.com
+    "srv:Tengine",          # 阿里系服务器指纹（阿里开源 nginx 分支）
+    "srv:Vercel",           # 前端托管平台（个人站富矿）
+    "srv:Netlify",          # 前端托管平台
+    "srv:cloudflare",
+    "srv:openresty",
+]
+
+
+def cloud_pump(arg):
+    """云厂商资产测绘泵：URLScan 按云厂商 ASN / 服务器指纹反查域名，不经过搜索引擎。
+
+    arg 形如 `asn:Alibaba`（按云厂商反查）/ `srv:Tengine`（按服务器指纹反查）。
+    返回 `https://` 开头的 URL 列表，交给 consider() 走与搜索引擎结果相同的判定链。
+    """
+    try:
+        from skynet import cloud as CL
+    except Exception as e:
+        print("[pump:cloud] skynet 内核不可用：%s" % e, flush=True)
+        return []
+    tag, _, val = (arg or "").partition(":")
+    try:
+        if tag == "asn":
+            doms = CL.cloud_asn_domains(val, limit=300)
+        elif tag == "srv":
+            doms = CL.urlscan_server_domains(val, limit=300)
+        else:
+            return []
+    except Exception as e:
+        print("[pump:cloud] 「%s」失败：%s" % (arg, e), flush=True)
+        return []
+    urls = ["https://" + d for d in doms if d and "." in d]
+    print("[pump:cloud] 「%s」→ 挖出 %d 个域名" % (arg, len(urls)), flush=True)
+    return urls
+
+
+# GitHub 代码挖域名泵：从全站代码里挖「自建站」域名 —— NAS / DDNS / 免费主机 / 个人站。
+# 这些站搜索引擎收录慢甚至不收录，但作者会在代码 / README / 配置里留下域名痕迹。
+# 目标用「类型:值」前缀表达：sfx=按自建站后缀挖（NAS/DDNS/免费主机）、cfg=按配置关键词泛挖。
+# 实测 sfx:duckdns.org 一次挖出 18 个真实自建站域名（betahowto.duckdns.org 等）。
+GHCODE_TARGETS = [
+    # —— NAS / DDNS 免费动态 DNS（自建站铁证，用户点名「NAS 相关」）——
+    "sfx:duckdns.org",          # DuckDNS 免费 DDNS（NAS 用户最爱）
+    "sfx:synology.me",          # 群晖 NAS
+    "sfx:myqnapcloud.com",      # 威联通 NAS
+    "sfx:myds.me",              # 群晖（旧 DDNS）
+    "sfx:myasustor.com",        # 华芸 NAS
+    "sfx:casacam.net",          # CasaOS（开源 NAS 系统）
+    "sfx:ddns.net",             # No-IP
+    "sfx:hopto.org",            # No-IP 免费域名
+    "sfx:zapto.org",            # No-IP 免费域名
+    "sfx:sytes.net",            # No-IP 免费域名
+    "sfx:servehttp.com",        # No-IP 免费域名
+    "sfx:mynetgear.com",        # 网件
+    # —— 国外免费主机 / PaaS（用户点名「国外免费服务器丢出来的站」）——
+    "sfx:pages.dev",            # Cloudflare Pages
+    "sfx:workers.dev",          # Cloudflare Workers
+    "sfx:onrender.com",         # Render 免费主机
+    "sfx:fly.dev",              # Fly.io
+    "sfx:railway.app",          # Railway
+    "sfx:repl.co",              # Replit
+    "sfx:glitch.me",            # Glitch
+    "sfx:surge.sh",             # Surge
+    "sfx:herokuapp.com",        # Heroku（免费层）
+    "sfx:pythonanywhere.com",   # PythonAnywhere
+    # —— 配置关键词泛挖（绑自己域名的自建站：VPS/家庭宽带/云主机）——
+    "cfg:server_name",          # nginx server_name 指令
+]
+
+
+def ghcode_pump(arg):
+    """GitHub 代码挖域名泵：gh search code 搜代码里的自建站域名，不经过搜索引擎。
+
+    arg 形如 `sfx:duckdns.org`（按后缀挖）/ `cfg:server_name`（按配置关键词泛挖）。
+    返回 `https://` 开头的 URL 列表，交给 consider() 走与搜索引擎结果相同的判定链。
+    """
+    try:
+        from skynet import ghcode as GH
+    except Exception as e:
+        print("[pump:ghcode] skynet 内核不可用：%s" % e, flush=True)
+        return []
+    tag, _, val = (arg or "").partition(":")
+    try:
+        if tag == "sfx":
+            doms = GH.gh_code_domains(val, limit=40)
+        elif tag == "cfg":
+            doms = GH.gh_code_server_names(limit=40)
+        else:
+            return []
+    except Exception as e:
+        print("[pump:ghcode] 「%s」失败：%s" % (arg, e), flush=True)
+        return []
+    urls = ["https://" + d for d in doms if d and "." in d]
+    print("[pump:ghcode] 「%s」→ 挖出 %d 个域名" % (arg, len(urls)), flush=True)
+    return urls
+
+
+# 图扩散泵的枢纽种子：目录站 / 导航站 / 软件库（外链多，是资源的汇聚点）。
+# 识别出枢纽后，以枢纽为锚做多跳 BFS，信噪比高于均匀扩散。
+GRAPH_HUB_SEEDS = [
+    "https://curlie.org/",            # 人工分类目录（全网最大 DMOZ 继任者）
+    "https://alternativeto.net/",     # 软件替代库
+    "https://sourceforge.net/",       # 老牌开源软件库
+    "https://paperswithcode.com/",    # 论文+代码+数据集
+    "https://awesome-selfhosted.netlify.app/",
+    "https://www.appinn.com/",        # 小众软件
+    "https://www.iplaysoft.com/",     # 异次元软件
+    "https://wiki.biligame.com/",     # 二次元站群（SIBLING_DOMS）
+    "https://arena.ai/agent",         # AI agent 平台（自主 agent 做浏览/研究/编程，评测前沿模型）
+]
+
+
+def selfindex_pump(arg):
+    """自建发现泵：CT 日志 + Common Crawl + 互联网档案馆，完全不经过搜索引擎。
+
+    arg 形如 `ct:biligame.com`（挖子域）/ `ctkw:dataset`（按关键词挖）/ `ctsfx:edu.cn`（按后缀挖）。
+    返回 `https://` 开头的 URL 列表，交给 consider() 走与搜索引擎结果相同的判定链。
+    """
+    try:
+        from skynet import selfindex as SI
+    except Exception as e:
+        print("[pump:selfindex] skynet 内核不可用：%s" % e, flush=True)
+        return []
+    tag, _, val = (arg or "").partition(":")
+    try:
+        if tag == "ct":
+            doms = SI.ct_subdomains(val, limit=200)
+        elif tag == "ctkw":
+            doms = SI.ct_keyword(val, limit=200)
+        elif tag == "ctsfx":
+            doms = SI.ct_suffix(val, limit=500)
+        elif tag == "ia":
+            doms = SI.archive_hosts(val, limit=200)
+        else:
+            return []
+    except Exception as e:
+        print("[pump:selfindex] 「%s」失败：%s" % (arg, e), flush=True)
+        return []
+    # 只保留能拼成 http URL 的域名（selfindex 已洗过，这里防御一下）
+    urls = ["https://" + d for d in doms if d and "." in d]
+    print("[pump:selfindex] 「%s」→ 挖出 %d 个域名" % (arg, len(urls)), flush=True)
+    return urls
+
+
 # 顺序 = 轮换次序（初版权重；运行后由 PUMP_STATS 自动降权零产出的泵）。
 # 🔴 查询词必须配对来源特性：学术 API 只吃学术词、GitHub 搜索只吃精准英文词、
 #     搜索引擎吃中文长尾 —— 这是本轮实测"13/15 泵产出 0"的根因。
@@ -795,6 +1281,12 @@ PUMPS = [
     ("curlie", curlie_pump, CURLIE_PATHS),               # 人工分类目录（实测 113 链接/类目）
     ("searx", searx_pump, KEYWORDS_EN[:40]),             # 多引擎聚合（实测 105 链接）
     ("wiby", wiby_pump, WIBY_KEYWORDS),                  # 老式小站索引
+    # —— 🔴 自建发现（2026-11-02 加）：不经过搜索引擎，见 selfindex_pump ——
+    ("selfindex", selfindex_pump, SELFINDEX_TARGETS),
+    # —— 🔴 云厂商资产测绘（2026-11-02 加）：读云厂商公开账本，见 cloud_pump ——
+    ("cloud", cloud_pump, CLOUD_TARGETS),
+    # —— 🔴 GitHub 代码挖域名（2026-11-02 加）：挖自建站/NAS/免费主机，见 ghcode_pump ——
+    ("ghcode", ghcode_pump, GHCODE_TARGETS),
 ]
 
 
@@ -899,10 +1391,27 @@ def _hidden_startupinfo():
 
 
 def _openers():
-    """双通道：先走本机代理，失败自动回退直连（有的站走代理被限流，直连反而通）。"""
-    p = urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
-    return [urllib.request.build_opener(p, urllib.request.HTTPSHandler(context=CTX)),
-            urllib.request.build_opener(urllib.request.HTTPSHandler(context=CTX))]
+    """默认直连；设了 NETFORCE_PROXY 时先走代理、失败回退直连。"""
+    if PROXY:
+        p = urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
+        return [urllib.request.build_opener(p, urllib.request.HTTPSHandler(context=CTX)),
+                urllib.request.build_opener(urllib.request.HTTPSHandler(context=CTX))]
+    return [urllib.request.build_opener(urllib.request.HTTPSHandler(context=CTX))]
+
+
+# 统一出口下，每建一条 CONNECT 隧道都要付一次 TLS/WS 握手（平峰约 3s，高峰更久）。
+# curl_cffi 的 Session 会在同一条 CONNECT 隧道上复用 keep-alive 请求，
+# 同线程后续请求不必重新握手。按线程存，避免多线程共用一个 libcurl 句柄。
+_CURL_LOCAL = threading.local()
+
+
+def _curl_session():
+    s = getattr(_CURL_LOCAL, "s", None)
+    if s is None:
+        from curl_cffi import requests as _cr
+        s = _cr.Session(impersonate="chrome")
+        _CURL_LOCAL.s = s
+    return s
 
 
 def _curl_get(url, timeout=6):
@@ -914,14 +1423,13 @@ def _curl_get(url, timeout=6):
       ③ 无
     每级都先走代理再直连。"""
     try:                                       # ① curl_cffi（TLS 指纹伪装）
-        from curl_cffi import requests as _cr
-        for px in ({'http': PROXY, 'https': PROXY}, None):
-            r = _cr.get(url, impersonate='chrome', proxies=px, timeout=timeout)
+        for px in ([{'http': PROXY, 'https': PROXY}] if PROXY else [None]):
+            r = _curl_session().get(url, proxies=px, timeout=timeout)
             if r.status_code < 400 and r.text:
                 return r.text
     except Exception:
         pass
-    for extra in (["-x", PROXY], []):           # ② 系统 curl
+    for extra in ([["-x", PROXY]] if PROXY else [[]]):           # ② 系统 curl
         try:
             # 🔴 隐藏窗口三件套（缺一不可，GitHub 上 1204 处实现都是这套）：
             #    curl 是控制台程序，父进程（pythonw）没有控制台时，Windows 会**新建
@@ -974,7 +1482,10 @@ def _raw_mirrors(url):
             f"https://cdn.statically.io/gh/{u}/{r}/{ref}/{p}"]
 
 
-def fetch(url, timeout=4):
+# 统一出口下，国外请求可能「直连首包探活 1.6s → 回落隧道握手约 3s」，
+# 原来的 4s 会在隧道刚要通时把请求掐断。放到 8s：成功请求直接返回，
+# 只有所有通道全灭才继续走四级兜底，不拖慢正常站点。
+def fetch(url, timeout=8):
     for op in _openers():
         try:
             req = urllib.request.Request(
@@ -1017,37 +1528,65 @@ BROWSER_EXE_CANDIDATES = [
     r'G:\_pw_chrome\chrome-win64\chrome.exe',
 ]
 
-_BW = {'pw': None, 'browser': None, 'ctx': None, 'tried': False}
+_BW = {'pw': None, 'browser': None, 'ctx': None, 'tried': False,
+       'last_try': 0.0}
 _BW_LOCK = threading.Lock()
+_BROWSER_COOLDOWN = 600.0        # 启动失败 10 分钟后允许再试，不一次判死
 
 
 def _browser_init():
-    """懒加载无头浏览器（第一次用到才启动，约 1-2 秒；用完常驻，进程退出时自动关）。"""
-    if _BW['tried']:
+    """懒加载无头浏览器（第一次用到才启动，约 1-2 秒；用完常驻）。
+
+    2026-11-09 修两处：① 老代码 `tried=True` 后失败就永久禁用，长跑进程
+    整晚都不再有第四级兜底（今晚日志确实撞到了）；改成 10 分钟冷却重试。
+    ② 系统 Chrome 被强杀后 launch 会抛「Target page/context/browser has been
+    closed」，此时降级到 Playwright 自带 chromium 再试一次，而不是整条放弃。
+    """
+    if _BW['ctx'] is not None:
         return _BW['ctx']
+    if _BW['tried'] and time.time() - _BW['last_try'] < _BROWSER_COOLDOWN:
+        return None
     _BW['tried'] = True
+    _BW['last_try'] = time.time()
     try:
         from playwright.sync_api import sync_playwright
-        exe = next((p for p in BROWSER_EXE_CANDIDATES if os.path.exists(p)), None)
-        if not exe:
-            return None
-        _BW['pw'] = sync_playwright().start()
-        _BW['browser'] = _BW['pw'].chromium.launch(
-            headless=True, executable_path=exe,
-            # 后几个 flag 是专门压窗口的：Chrome 被强杀过一次后，下次启动会弹
-            #「未正常关闭 / 恢复页面」的气泡窗口，无头模式也可能冒出来。
-            args=['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-                  '--disable-blink-features=AutomationControlled',
-                  '--disable-session-crashed-bubble', '--disable-infobars',
-                  '--no-first-run', '--no-default-browser-check',
-                  '--disable-restore-session-state'])
+        exe = browser_pick.pick(BROWSER_EXE_CANDIDATES)   # 真起一次再定，别写死系统 Chrome
+        cands = [exe, ""] if exe else [""]
+        for cand in cands:
+            try:
+                if _BW['pw'] is None:
+                    _BW['pw'] = sync_playwright().start()
+                _BW['browser'] = _BW['pw'].chromium.launch(
+                    headless=True, **browser_pick.launch_kw(cand),
+                    # 后几个 flag 是专门压窗口的：Chrome 被强杀过一次后，
+                    # 下次启动会弹「未正常关闭 / 恢复页面」气泡，无头也可能冒。
+                    args=['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+                          '--disable-blink-features=AutomationControlled',
+                          '--disable-session-crashed-bubble', '--disable-infobars',
+                          '--no-first-run', '--no-default-browser-check',
+                          '--disable-restore-session-state'])
+                exe = cand
+                break
+            except Exception as e:
+                print("  [browser] %s 启动失败：%s" %
+                      (cand or "playwright-chromium", str(e)[:70]), flush=True)
+                try:
+                    if _BW['pw']:
+                        _BW['pw'].stop()          # 清掉半死的 driver，否则下次必失败
+                except Exception:
+                    pass
+                _BW['pw'], _BW['browser'] = None, None
+        if _BW['browser'] is None:
+            raise RuntimeError("all browser candidates failed")
         _BW['ctx'] = _BW['browser'].new_context(
             user_agent=UA_BROWSER,
             proxy={'server': PROXY} if PROXY else None,
             viewport={'width': 1366, 'height': 900})
-        print("  [browser] 无头浏览器已就绪: %s" % exe, flush=True)
+        print("  [browser] 无头浏览器已就绪: %s"
+              % (exe or "playwright-chromium"), flush=True)
     except Exception as e:
-        print("  [browser] 无头浏览器不可用（%s），跳过第四级兜底" % str(e)[:80], flush=True)
+        print("  [browser] 无头浏览器暂不可用（%s），%d 秒后可重试" %
+              (str(e)[:70], int(_BROWSER_COOLDOWN)), flush=True)
         _BW['ctx'] = None
     return _BW['ctx']
 
@@ -1174,6 +1713,14 @@ def classify(u, dom):
 
 
 def main():
+    # 任务层开机动作：守住统一出口（掉线自愈）+ 恢复未完成重试（断点续传）
+    threading.Thread(target=egress_watchdog, daemon=True).start()
+    retry_q = load_retries()
+    attempts = {}
+    for _due, _u, _n in list(retry_q):
+        attempts[canon(_u)] = _n
+    if retry_q:
+        print('[retry] 从盘上恢复待重试 %d 条' % len(retry_q), flush=True)
     collected = []
     seen_dom = set()
     out = os.path.join(_HERE_DIR, 'resources.json')
@@ -1185,7 +1732,32 @@ def main():
         collected = list(prev)
     except Exception:
         pass
+    # 发现闭环：render_parse.py 把「JS 渲染后才出现」的新域名/资源写进
+    # _kb/discovered.jsonl；主爬虫启动时回灌进队列，形成 发现→解析→再发现 的循环。
+    def feed_discovered(max_n=1500):
+        path = os.path.join(_HERE_DIR, '_kb', 'discovered.jsonl')
+        got = []
+        try:
+            with open(path, encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    if o.get('type') != 'domain':
+                        continue
+                    d = (o.get('value') or '').strip().lower()
+                    if d and d not in seen_dom and '.' in d and ' ' not in d:
+                        got.append('https://' + d + '/')
+        except Exception:
+            pass
+        return got[:max_n]
+
     queue = list(SEEDS)
+    _fed = feed_discovered()
+    queue.extend(_fed)
+    if _fed:
+        print("[feed] 启动回灌渲染发现的新域名 %d 个" % len(_fed), flush=True)
     visited = load_visited(seen_dom)      # 断点续爬：重启不重爬（Scrapy JOBDIR 等价）
     lock = threading.Lock()               # 并发下保护 queue/visited/collected/落盘
     dom_locks = {}                     # 单域名限流（防把单站打成 WAF 黑名单）
@@ -1236,24 +1808,81 @@ def main():
     def boot_pump(_arg=None):
         return evolve.bootstrap_search(log=_evo_log)
 
+    def graph_pump(_arg=None):
+        """图扩散泵：多跳 BFS 爬外链图，不经过任何搜索引擎。
+
+        先识别枢纽站（出度高的目录/导航站），再以枢纽为锚做 2 跳扩散。
+        这是「网络本身」的图结构，供给不受收录限制。
+        """
+        import graphdiffuse as gd
+        try:
+            hubs = gd.hubs(GRAPH_HUB_SEEDS, n=12, log=_evo_log)
+            seeds = hubs or list(GRAPH_HUB_SEEDS)
+            return gd.bfs(seeds, depth=2, per_node=60, max_total=600,
+                          seen_doms=seen_dom, log=_evo_log)
+        except Exception as e:
+            print("[pump:graph] 失败：%s" % e, flush=True)
+            return []
+
+    def external_pump(_arg=None):
+        """外生源注入泵（2026-11-09 第二层）：打破自举 S→S 的闭合映射。
+
+        link / graph / boot 三个泵的输入全都来自自己的库，输出又写回自己的库
+        ⇒ 数学上必然收敛。这个泵喂的是证书透明日志 / Common Crawl /
+        Wikipedia 外链 / sitemap 等**集合外**的新域名，是真正的外生信息口。
+        种子池 append 落盘、异步补种，不阻塞本轮 pump。
+        """
+        try:
+            import external_seeds as es
+            return es.next_batch(n=40, seen_doms=seen_dom, log_fn=_evo_log)
+        except Exception as e:
+            print("[pump:external] 失败：%s" % str(e)[:100], flush=True)
+            return []
+
     LOCAL_PUMPS = PUMPS + [("link", link_pump, ["-"]),
-                           ("boot", boot_pump, ["-"])]
+                           ("graph", graph_pump, ["-"]),
+                           ("boot", boot_pump, ["-"]),
+                           ("external", external_pump, ["-"])]
 
     # —— 泵的自适应调度（借鉴 Scrapy 调度器/AutoThrottle 的自适应思想）——
     # 死板轮换会让零产出的源一直占着轮次（本轮实测 13/15 泵产出 0）。
     # 做法：按"历史命中率"给每个源算权重 → 加权随机抽（保留 0.35 底权，冷门源不被饿死）。
-    PUMP_STATS = {p[0]: {'rounds': 0, 'hits': 0, 'noise': 0} for p in LOCAL_PUMPS}
+    #
+    # 🔴 死源冷却（2026-11-05 加）：0.35 底权对「暂时冷门」是对的，但对「网络层
+    # 被墙 / 接口已死」的源是浪费——日志实测 8 个泵累计 637 轮 0 产出仍不断被抽中，
+    # 每轮还要走完 fetch 四级兜底（≈1 分钟）。现在连续 DRY_LIMIT 轮 0 产出就进入
+    # 冷却，权重归 0；到期自动复活试探，若仍 0 则指数退避延长冷却。
+    # ⚠️ 只降权不删源：网络恢复 / 开了代理之后，冷却到期即自动复活，不会永久饿死。
+    DRY_LIMIT = 8
+    COOL_BASE = 600.0        # 首次冷却 10 分钟
+    COOL_MAX = 3600.0        # 封顶 1 小时
+    PUMP_STATS = {p[0]: {'rounds': 0, 'hits': 0, 'noise': 0,
+                         'dry': 0, 'cool_until': 0.0, 'cool_lv': 0}
+                  for p in LOCAL_PUMPS}
 
     def pump_weight(nm):
         s = PUMP_STATS[nm]
-        if s['rounds'] < 2:                 # 样本不足时给中等权重，先观察
+        if time.time() < s['cool_until']:
+            return 0.0                          # 冷却中：本轮不参与抽取
+        if s['rounds'] < 2:                    # 样本不足时给中等权重，先观察
             return 1.0
         rate = s['hits'] / max(1, s['rounds'])
         return 0.35 + 3.0 * min(1.0, rate * 5)   # 0 有效产出 → 0.35（低但不死）；高产 → 上限
 
     def pick_pump():
         import random
+        # 给「外生信息口」保留固定探索预算（默认 18%）。
+        # 只靠自适应权重会被高产老泵占满，闭环又会慢慢合上 —— 这是
+        # ε-greedy 里的 ε，跟 external_seeds 内部的源级 ε 是两层。
+        budget = float((_task_cfg() or {}).get('external_budget', 0.18))
+        ext = next((p for p in LOCAL_PUMPS if p[0] == 'external'), None)
+        if ext and random.random() < budget and pump_weight('external') > 0:
+            return ext
         ws = [pump_weight(p[0]) for p in LOCAL_PUMPS]
+        if not any(ws):                          # 防御：极端情况全在冷却 → 全部复活重抽
+            for s in PUMP_STATS.values():
+                s['cool_until'] = 0.0
+            ws = [pump_weight(p[0]) for p in LOCAL_PUMPS]
         pick = random.choices(range(len(LOCAL_PUMPS)), weights=ws, k=1)[0]
         return LOCAL_PUMPS[pick]
 
@@ -1263,29 +1892,47 @@ def main():
         s['rounds'] += 1
         s['hits'] += hits
         s['noise'] += noise
+        if hits > 0:                             # 一旦复活出量，清掉全部冷却状态
+            s['dry'] = 0
+            s['cool_lv'] = 0
+            s['cool_until'] = 0.0
+            return
+        s['dry'] += 1
+        if s['dry'] >= DRY_LIMIT:
+            s['cool_lv'] += 1
+            dur = min(COOL_MAX, COOL_BASE * (2 ** (s['cool_lv'] - 1)))
+            s['cool_until'] = time.time() + dur
+            s['dry'] = 0
+            print("[pump-cool] 「%s」连续 %d 轮 0 产出 → 冷却 %.0f 分钟（到期自动复活试探）"
+                  % (nm, DRY_LIMIT, dur / 60), flush=True)
 
     def pump_note(nm):
         s = PUMP_STATS[nm]
-        return "｜累计 %d 轮 / 有效 %d / 噪声 %d" % (s['rounds'], s['hits'], s['noise'])
+        left = s['cool_until'] - time.time()
+        tail = ("｜冷却中 %.0f 分" % (left / 60)) if left > 0 else ""
+        return "｜累计 %d 轮 / 有效 %d / 噪声 %d%s" % (
+            s['rounds'], s['hits'], s['noise'], tail)
 
     # —— 自适应并发（借鉴 Scrapy AutoThrottle 的核心洞察）——
     # Scrapy 的 AutoThrottle 不是"固定延迟+硬并发"，而是按**实测响应延迟**调延迟：
     #   目标延迟 = latency / 目标并发；下一个延迟 = 上次延迟与目标延迟的均值；
     #   **非 200 响应只允许把延迟调大、不允许调小**（错误多说明我们打太狠了，要减速）。
     # 我们没有 per-domain slot，就落成全局自适应：有效率低 → 降并发；有效率高 → 升并发。
-    workers = {'n': 16}   # 初始并发下调（原 32）：机器内存吃紧
+    # 错峰（Scrapy AutoThrottle 思路的轻量版）：晚高峰上限减半，平峰放到 40 甜点值
+    workers = {'n': min(32, peak_cap())}
 
     def tune_workers(hits, noise, tried):
         if tried < 5:
             return workers['n']
         eff = (hits - noise) / max(1, tried)          # 有效产出率
+        cap = peak_cap()                              # 晚高峰自动压低并发
         if eff < 0.05:
-            workers['n'] = max(8, workers['n'] // 2)  # 打不动就减速，别硬撞
+            workers['n'] = max(6, min(cap, workers['n'] // 2))  # 打不动就减速
         elif eff > 0.25:
-            # ⚠️ 上限从 64 降到 24（2026-10-18）：用户实测机器被拖卡（内存 12.5/15.4 GB）。
-            # 并发 48-64 时每个线程各持一个 socket + HTML 缓冲，内存和 CPU 都吃紧，
-            # 而产出并没有等比增长（瓶颈是 URL 供给不是并发）⇒ 24 是本机甜点值。
-            workers['n'] = min(24, int(workers['n'] * 1.5))   # 好使就加速
+            # ⚠️ 上限原 64→24（2026-10-18，当时机器内存吃紧 12.5/15.4 GB）。
+            # 并发上限：内存余量大时放宽到 40 甜点值。
+            # 并发 48-64 时每个线程各持 socket + HTML 缓冲仍偏重，故止于 40。
+            workers['n'] = min(cap, int(workers['n'] * 1.5))    # 好使就加速
         return workers['n']
 
     def consider(u, via):
@@ -1340,9 +1987,16 @@ def main():
         # 落盘也放锁内：并发写同一个 json 会写坏文件。
         # ⚠️ 别每条都全量重写（2800 条 ≈700KB，收 N 条就是 O(N²) 的 IO —— 实测这是
         #    并发版的真实瓶颈之一）。改成"脏标记 + 定时/定量批量落盘"，仍保证不丢数据。
+        try:                   # 入册即带地域判据，下游检索/分流不必重算
+            import egress_route as _er
+            _rd = _er.classify_detail(dom, 443)
+            _region, _rbasis = _rd["region"], _rd["source"] + ":" + _rd["reason"]
+        except Exception:
+            _region, _rbasis = "", ""
         with lock:
             collected.append({'url': u, 'domain': dom,
                               'type': classify(u, dom), 'found_via': via,
+                              'region': _region, 'region_basis': _rbasis,
                               'noise': bool(NOISE_RE.search(dom))})
             n = len(collected)
             dirty['n'] += 1
@@ -1410,7 +2064,7 @@ def main():
                 note_pump(name, len(fresh_seed))
                 pi += 1
                 if not fresh_seed:
-                    time.sleep(1)
+                    time.sleep(0.3)
                 continue
             else:
                 arg = pool[qi % len(pool)]
@@ -1437,6 +2091,7 @@ def main():
                 #   等于掐掉最有价值的种子来源。现在把新增队列深度也计入有效产出。
                 qadded = max(0, len(queue) - q0)
                 save_visited(visited)          # 每轮落盘去重指纹 → 重启不重爬
+                save_retries(retry_q)          # 重试队列同步落盘（断点续传）
                 flush_now()                    # 每轮结束强制落盘（防中断丢数据）
                 note_pump(name, max(0, n - noise) + qadded, noise)
                 print("[pump:%s] 关键词「%s」→ 命中 %d 条（去重后 %d 待查），入册 %d（噪声 %d）"
@@ -1445,19 +2100,42 @@ def main():
                          qadded, len(queue), workers['n'], pump_note(name)), flush=True)
                 pi += 1
                 if not got:
-                    time.sleep(1)
+                    time.sleep(0.3)
                 continue
+        # 到期重试优先插到队首：失败过的 URL 不再被直接丢掉
+        due_items = pop_due_retries(retry_q)
+        if due_items:
+            with lock:
+                for ru, rn in due_items:
+                    if rn <= int(_task_cfg()["retry_max"]):
+                        attempts[canon(ru)] = rn
+                        queue.insert(0, ru)
+            save_retries(retry_q)
         with lock:
             url = queue.pop(0) if queue else None
         if not url:
-            time.sleep(1)
+            # 队列空了就从渲染引擎再回灌一轮，让「解析出来的新域名」持续喂回发现端
+            _fed = feed_discovered(500)
+            if _fed:
+                with lock:
+                    queue.extend(_fed)
+                print("[feed] 队列空，回灌 %d 个新域名" % len(_fed), flush=True)
+            else:
+                time.sleep(1)
             continue
         with lock:
             k = canon(url)
-            if not visited.add(k):
+            fresh_url = visited.add(k)
+            # 重试项虽然指纹已见过，仍放行一次；普通重复项照旧跳过
+            if not fresh_url and k not in attempts:
                 continue
+            retry_n = attempts.pop(k, 0)
         html = fetch(url)
         if not html:
+            n0 = retry_n + 1
+            if n0 <= int(_task_cfg()["retry_max"]):
+                note_retry(retry_q, url, n0, "fetch-empty")
+                time.sleep(peak_backoff())       # 晚高峰退避，别硬撞
             continue
         links = URL_RE.findall(html)
         # 目录页里的链接同样并发评估（Scrapy CONCURRENT_REQUESTS 的简化版：12 并发）
@@ -1466,6 +2144,7 @@ def main():
             list(ex.map(lambda u: consider(u, tname), links))
 
     save_visited(visited)
+    save_retries(retry_q)
     flush_now()
     print('DONE: 收集 %d 个资源站（去重指纹 %d） → %s'
           % (len(collected), len(visited), out))
@@ -1973,8 +2652,12 @@ def diffuse_crawl(limit=None):
 
 
 if __name__ == '__main__':
-    # 三模式：默认 discover（资源发现）；corpus 角色语料；diffuse 站群定向扩散
-    if len(sys.argv) > 1 and sys.argv[1] == 'diffuse':
+    # 四模式：--resumable 单文件续传 / diffuse / corpus / 默认 discover
+    if len(sys.argv) > 3 and sys.argv[1] == '--resumable':
+        _n = resumable_download(sys.argv[2], sys.argv[3])
+        print('[resumable] %d bytes -> %s' % (_n, sys.argv[3]), flush=True)
+        sys.exit(0 if _n else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == 'diffuse':
         _lim = None
         if '--limit' in sys.argv:
             _lim = int(sys.argv[sys.argv.index('--limit') + 1])

@@ -36,7 +36,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
-PROXY = os.environ.get("NETFORCE_PROXY", "http://127.0.0.1:3067")
+# 默认直连（空字符串 = 全程直连）。设 NETFORCE_PROXY 才走代理——本机代理关着时
+# 死代理地址只会让每请求白白试一轮再降级，拖慢整条管线。
+PROXY = os.environ.get("NETFORCE_PROXY", "")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -98,12 +100,12 @@ def headers_for(host: str, referer: str = "") -> dict:
         h["Referer"] = referer
     return h
 
-# 出口列表：默认单出口（本机只有 3067），加第二个代理时改环境变量即可，不用改代码
+# 出口列表：默认单出口（本机只有 7890），加第二个代理时改环境变量即可，不用改代码
 PROXIES = [p.strip() for p in
            os.environ.get("NETFORCE_PROXIES", PROXY).split(",") if p.strip()]
 
 # 每域并发上限。抓 wiki 这类单站批量页时，6 个 worker 全打一个域 = 6 并发，容易被风控
-HOST_CONCURRENCY = int(os.environ.get("NETFORCE_HOST_CONC", "3"))
+HOST_CONCURRENCY = int(os.environ.get("NETFORCE_HOST_CONC", "6"))
 
 # 风控状态码。567 是 wiki.biligame 这类站点的瞬时限流码（不是标准码），
 # 412 是 bilibili 系的风控码 —— 这两个不认识的后果是「被拦了还当成功重试」。
@@ -653,7 +655,7 @@ def _via_curl(url: str, timeout: float) -> FetchResult:
     host = urllib.parse.urlparse(url).netloc
     ua = ua_for(host)
     last_status = 0
-    for extra in (["-x", PROXY], []):
+    for extra in ([["-x", PROXY]] if PROXY else [[]]):
         path = None
         try:
             fd, path = tempfile.mkstemp(suffix=".bin")
@@ -855,8 +857,11 @@ def _fetch_inner(url: str, host: str, timeout: float, gap: float,
     deadline = t0 + budget
     last = FetchResult(url=url, error="no channel")
     # 顺序：复用通道打头（省握手），再走无复用的两档兜底，最后子进程 curl。
-    channels = [force_channel] if force_channel else ["session", "urllib_proxy",
-                                                     "urllib_direct", "curl", "doh"]
+    # 无代理时跳过 urllib_proxy 通道，避免空代理串白白试一轮连接再降级。
+    _ch = ["session", "urllib_direct", "curl", "doh"]
+    if PROXIES:
+        _ch.insert(1, "urllib_proxy")
+    channels = [force_channel] if force_channel else _ch
     stop = False
     for name in channels:
         if stop:
