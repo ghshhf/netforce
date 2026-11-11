@@ -141,7 +141,7 @@ def upsert(c, rec, src_file, src_line):
         return False
     title = (rec.get("title") or "").strip()[:300]
     desc = (rec.get("desc") or "").strip()[:600]
-    text = (rec.get("text") or "")[:20000]
+    text = (rec.get("text") or "")[:200000]
     snippet = text[:700]
     forms = tags.get("forms") or []
     topics = tags.get("topics") or []

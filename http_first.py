@@ -184,7 +184,7 @@ def _main_text(doc):
     except Exception:
         pass
     text = best if best_len >= max(180, len(full) * 0.3) else (full or best)
-    return text[:20000], round(len(text) / max(1, len(full)), 3), best_tag
+    return text[:200000], round(len(text) / max(1, len(full)), 3), best_tag
 
 
 def _extract_lxml(html):
@@ -320,7 +320,7 @@ def _build(dom, url, scheme, status, data, elapsed, last_modified=""):
         "og": og, "jsonld": jsonld,
         "structured": bool(og or jsonld),
         "headings": data.get("headings", []),
-        "text": text[:20000], "text_len": len(text),
+        "text": text[:200000], "text_len": len(text),
         "text_density": data.get("text_density"),
         "main_tag": data.get("main_tag") or "",
         "region": reg["region"], "region_basis": reg["region_basis"],

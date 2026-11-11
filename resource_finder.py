@@ -22,6 +22,7 @@ import datetime
 import ssl
 import socket
 import subprocess
+import headless
 import os
 import threading
 from collections import deque
@@ -1437,7 +1438,7 @@ def _curl_get(url, timeout=6):
             #    · STARTUPINFO + STARTF_USESHOWWINDOW + SW_HIDE（真正的隐藏开关）
             #    · CREATE_NO_WINDOW（不分配控制台）
             #    · stdin=DEVNULL（不继承句柄，逼不出来控制台）
-            r = subprocess.run(
+            r = headless.run(
                 ["curl", "-s", "-L", "--compressed", "-A",
                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -2017,6 +2018,7 @@ def main():
     #   每轮开始打点播报总入册数 + 队列深度 + 已运行时长，便于随时判断"它还在动没"。
     started = time.time()
     cycles = 0
+    idle_spin = 0          # 连续「零工作量」轮次计数，见下方重复指纹分支
     while True:
         if datetime.datetime.now() >= deadline:
             cycles += 1
@@ -2127,9 +2129,21 @@ def main():
             k = canon(url)
             fresh_url = visited.add(k)
             # 重试项虽然指纹已见过，仍放行一次；普通重复项照旧跳过
-            if not fresh_url and k not in attempts:
-                continue
-            retry_n = attempts.pop(k, 0)
+            dup = (not fresh_url and k not in attempts)
+            retry_n = attempts.pop(k, 0) if not dup else 0
+        if dup:
+            # 🔴 忙循环防护（11-12 主人：写出来的 bug 容易造成死循环）：
+            #   这分支既不发请求、也不落盘、也不等待，队列里若全是旧指纹，
+            #   配合「队列空就回灌」会形成零等待闭环，CPU 直接打满。
+            #   每 64 个连续空转让出 0.5 秒并落盘；下面真正 fetch 时清零，
+            #   正常爬取节奏完全不受影响。
+            idle_spin += 1
+            if idle_spin >= 64:
+                time.sleep(0.5)
+                idle_spin = 0
+                save_visited(visited)
+            continue
+        idle_spin = 0
         html = fetch(url)
         if not html:
             n0 = retry_n + 1
@@ -2311,7 +2325,7 @@ def corpus_fetch(url, throttle, referer=None, tries=3):
             url,
         ]
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=60)
+            p = headless.run(cmd, capture_output=True, timeout=60)
             raw = p.stdout
             if b"__META__" not in raw:
                 throttle.note_fail()
@@ -2527,7 +2541,7 @@ def anime_log(msg):
 def anime_get(url, timeout=45):
     """站群直连取页 → (html, size, final_url)；风控/失败返回 (None, size, fin)。"""
     try:
-        p = subprocess.run(
+        p = headless.run(
             ["curl", "-sL", "--noproxy", "*", "--max-time", str(timeout),
              "-A", UA_BROWSER,
              "-H", "Referer: " + ANIME_BASE,
