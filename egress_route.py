@@ -72,11 +72,19 @@ _note = {}                            # host -> "cn"/"foreign"  手工标注
 _usage = defaultdict(lambda: {"n": 0, "ok": 0, "fail": 0,
                               "bytes": 0, "ms": 0.0, "ttfb": 0.0})
 _cfg_cache = [0.0, {}]
+_cfg_tunnel_seen = [""]        # 上一次配置里的隧道地址；变化即清熔断（见 _cfg）
 
 
 # ------------------------------------------------------------------ 配置
 def _cfg():
-    """读 _netpolicy.json（热加载）。只关心出口相关的几个键，其余用默认。"""
+    """读 _netpolicy.json（热加载）。只关心出口相关的几个键，其余用默认。
+
+    🔴 隧道地址变化时自动清掉旧域名攒下的失败状态（熔断计数 + tunnel 坏记录）。
+    这是「换域名/回滚不用重启 selfproxy」的关键：旧域名被封时累计的
+    `_TUNNEL_BREAK` 与 `tunnel_bad` 都是进程内存状态，配置热加载了它们却不会
+    自动失效，会把新域名也连坐判死、只能靠重启清空。这里在读到新地址的瞬间
+    主动清掉，于是改一处配置即可热生效——不停爬虫、不中断任何在跑的任务。
+    """
     try:
         mt = os.path.getmtime(CONFIG)
     except Exception:
@@ -102,6 +110,15 @@ def _cfg():
         cfg["foreign_prefer"] = (raw.get("foreign_prefer") or "direct").lower()
     except Exception:
         pass
+    # 隧道地址变了（换域名/临时关闭）⇒ 旧地址的成功率/熔断史对新地址无意义，清掉。
+    # 放在配置更新后、返回前；只在此处做，避免每个请求都无谓清状态。
+    if cfg["tunnel"] != _cfg_tunnel_seen[0]:
+        with LOCK:
+            _TUNNEL_BREAK["fails"] = 0
+            _TUNNEL_BREAK["until"] = 0.0
+            for k in [k for k in _usage if k[1] == "tunnel"]:
+                _usage.pop(k, None)
+        _cfg_tunnel_seen[0] = cfg["tunnel"]
     _cfg_cache[0], _cfg_cache[1] = mt, cfg
     return cfg
 
