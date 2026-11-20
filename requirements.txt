@@ -1,0 +1,6 @@
+# 天网 netforce 依赖清单（clone 后 pip install -r requirements.txt）
+# 核心抓取层
+httpx>=0.27
+lxml>=5.0
+# 说明：标准库模块（urllib/sqlite3/concurrent.futures 等）无需列出。
+# 出网层 skynet-fleet 的依赖在它自己的仓库里，本清单只管 netforce。
