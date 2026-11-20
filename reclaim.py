@@ -233,6 +233,13 @@ def _rec_from_html(dom, url, html, channel, egress="direct", status=200):
     return rec
 
 
+# 拦截页的强特征（不放 "cloudflare" 这种泛词，避免误伤介绍它的文章）
+_BLOCK_STRONG = ("just a moment", "attention required", "checking your browser",
+                 "verify you are human", "enable javascript and cookies",
+                 "cf-browser-verification", "人机验证", "请完成验证",
+                 "访问被拒绝", "access denied")
+
+
 def _ok_rec(rec):
     """「救回」的门槛：只拿到 <title> 的拦截页 / 空壳不算数。
 
@@ -243,6 +250,15 @@ def _ok_rec(rec):
     if not rec or not rec.get("ok"):
         return False
     n = int(rec.get("text_len") or 0)
+    # 2026-11-14 补：光看长度会把「拦截页」当正文。
+    # 实测 30 条 waf 队列，标成救回 14 条，其中 10 条是
+    # "Attention Required! | Cloudflare"（516 字）和 "Just a moment..."（16 字），
+    # 真内容只有 3 条。⇒ 先认拦截页特征，再谈长度；长文里顺带提到这些词的不算。
+    title = (rec.get("title") or "").lower()
+    head = (rec.get("text") or "")[:600].lower()
+    for w in _BLOCK_STRONG:
+        if (w in title or w in head) and n < 1500:
+            return False
     if n >= 120:
         return True
     if n >= 40 and (rec.get("title") or "").strip() and rec.get("status") == 200:
@@ -331,7 +347,8 @@ def _browser_batch(items, timeout, cap):
     return out, errs
 
 
-def run(limit=100, conc=None, timeout=9.0, batches=1, browser=0, reason=""):
+def run(limit=100, conc=None, timeout=9.0, batches=1, browser=0, reason="",
+        domain_glob=""):
     conc = int(conc or conc_now())
     c = connect()
     total_ok, total_try = 0, 0
@@ -343,6 +360,11 @@ def run(limit=100, conc=None, timeout=9.0, batches=1, browser=0, reason=""):
         if reason:
             sql += "AND reason=? "
             par.append(reason)
+        if domain_glob:
+            # 2026-11-14：按域名后缀分流。国内站直连可通、国际站要隧道，
+            # 混在一批里跑会让「通道判断」失真，必须能分开跑。
+            sql += "AND domain LIKE ? "
+            par.append(domain_glob)
         sql += "ORDER BY priority DESC, attempts ASC, RANDOM() LIMIT ?"
         par.append(limit)
         rows = c.execute(sql, par).fetchall()
@@ -444,12 +466,15 @@ def main():
     ap.add_argument("--reason", default="",
                     choices=["", "waf", "unreachable", "login", "pending",
                              "unvisited"], help="只跑某一类欠账（试点用）")
+    ap.add_argument("--domain-glob", default="",
+                    help="只跑匹配的域名，如 '%%.cn'（分流国内/国际目标）")
     a = ap.parse_args()
     if a.build:
         build()
     if a.run:
         run(limit=a.run, conc=a.conc or None, timeout=a.timeout,
-            batches=a.batch, browser=a.browser, reason=a.reason)
+            batches=a.batch, browser=a.browser, reason=a.reason,
+            domain_glob=a.domain_glob)
     if a.stats or not (a.build or a.run):
         stats()
 

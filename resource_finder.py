@@ -1735,24 +1735,41 @@ def main():
         pass
     # 发现闭环：render_parse.py 把「JS 渲染后才出现」的新域名/资源写进
     # _kb/discovered.jsonl；主爬虫启动时回灌进队列，形成 发现→解析→再发现 的循环。
+    # 增量游标：只回灌「上次读过之后新追加的行」。
+    # 旧实现每次从第 0 行重读，队列一空就回灌同一批最前面的旧域名，
+    # 出队全判 dup（无等待 continue）→ 队列再空 → 零等待闭环。这里从结构上拆环。
+    feed_state = {'off': 0, 'fed': set()}
+
     def feed_discovered(max_n=1500):
         path = os.path.join(_HERE_DIR, '_kb', 'discovered.jsonl')
         got = []
         try:
-            with open(path, encoding='utf-8') as f:
-                for line in f:
+            with open(path, 'rb') as f:
+                if feed_state['off'] > os.path.getsize(path):
+                    # 文件被重写/截断：游标与去重集一起复位，保持两者一致
+                    feed_state['off'] = 0
+                    feed_state['fed'].clear()
+                f.seek(feed_state['off'])
+                for raw in f:
+                    if not raw.endswith(b'\n'):
+                        break                    # 半行：不推进游标，留到下次
+                    feed_state['off'] += len(raw)
                     try:
-                        o = json.loads(line)
+                        o = json.loads(raw.decode('utf-8'))
                     except Exception:
                         continue
                     if o.get('type') != 'domain':
                         continue
                     d = (o.get('value') or '').strip().lower()
-                    if d and d not in seen_dom and '.' in d and ' ' not in d:
+                    if d and d not in seen_dom and d not in feed_state['fed'] \
+                            and '.' in d and ' ' not in d:
+                        feed_state['fed'].add(d)
                         got.append('https://' + d + '/')
+                        if len(got) >= max_n:
+                            break                # 剩余行留到下次，不丢
         except Exception:
             pass
-        return got[:max_n]
+        return got
 
     queue = list(SEEDS)
     _fed = feed_discovered()
@@ -2018,7 +2035,6 @@ def main():
     #   每轮开始打点播报总入册数 + 队列深度 + 已运行时长，便于随时判断"它还在动没"。
     started = time.time()
     cycles = 0
-    idle_spin = 0          # 连续「零工作量」轮次计数，见下方重复指纹分支
     while True:
         if datetime.datetime.now() >= deadline:
             cycles += 1
@@ -2132,18 +2148,9 @@ def main():
             dup = (not fresh_url and k not in attempts)
             retry_n = attempts.pop(k, 0) if not dup else 0
         if dup:
-            # 🔴 忙循环防护（11-12 主人：写出来的 bug 容易造成死循环）：
-            #   这分支既不发请求、也不落盘、也不等待，队列里若全是旧指纹，
-            #   配合「队列空就回灌」会形成零等待闭环，CPU 直接打满。
-            #   每 64 个连续空转让出 0.5 秒并落盘；下面真正 fetch 时清零，
-            #   正常爬取节奏完全不受影响。
-            idle_spin += 1
-            if idle_spin >= 64:
-                time.sleep(0.5)
-                idle_spin = 0
-                save_visited(visited)
+            # 环已在 feed_discovered 处拆掉：回灌只读新增行，不会再无限喂旧指纹。
+            # 这里不需要计数器判断，队列里旧指纹出完自然就走队列空分支的 sleep(1)。
             continue
-        idle_spin = 0
         html = fetch(url)
         if not html:
             n0 = retry_n + 1

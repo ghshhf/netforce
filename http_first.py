@@ -632,7 +632,7 @@ def _raise_dns_threads(n=512):
 # 取值原则：**优先成功**，速度够用就行 ——
 # 因为判死判错，将来重试要再花一遍时间，不如当场做对。
 # 后两轮并发不降：待处理的都是「难啃的」，降并发只会让它们排更多批、白等更多超时。
-_ROUNDS = ((64, 4.0), (64, 10.0), (96, 18.0))
+_ROUNDS = ((64, 4.0), (64, 10.0), (96, 10.0))
 
 
 def fetch_many(items, conc=64, timeout=10.0, min_text=500, allow_dead=True,
@@ -712,9 +712,9 @@ def fetch_many(items, conc=64, timeout=10.0, min_text=500, allow_dead=True,
     return done, rest
 
 
-# 滚动模式的超时阶梯：第 1 次 4s，第 2 次 10s，第 3 次 18s。
+# 滚动模式的超时阶梯：第 1 次 4s，第 2 次 10s，第 3 次 10s。
 # 与 _ROUNDS 的区别是「谁等」——旧版让整批等，这里只让超时的那一条自己等。
-_SLIDE_TO = (4.0, 10.0, 18.0)
+_SLIDE_TO = (4.0, 10.0, 10.0)
 
 
 def fetch_many_slide(items, conc=96, timeout=10.0, min_text=500,

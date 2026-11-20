@@ -9,6 +9,9 @@
     python nf.py index --rebuild               重建知识库索引
     python nf.py search 数据集 --min-quality 40
     python nf.py search llm --context --limit 5 （可直接喂给模型）
+    python nf.py web "python asyncio 教程"     联网搜索+整合答案（意图驱动，P0/P1/P2）
+    python nf.py web "碧蓝航线 语音" --route   只看意图选源决策
+    python nf.py web "xxx" --no-llm            只搜索不调模型
     python nf.py probe                         只读出网能力报告
     python nf.py set-proxy http://1.2.3.4:8080 远程显式指定固定出口
     python nf.py set-proxy ""                  撤销，回纯直连
@@ -47,6 +50,12 @@ def main():
         print(__doc__)
         return 0
     cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "web":
+        # 联网搜索编排层同进程调用：它只读配置/走 18080，无副作用；
+        # 走 headless 子进程会因 CREATE_NO_WINDOW 丢 stdout（nf.py 老毛病），
+        # 且不值得为一个展示型命令改所有命令的通用行为。
+        import websearch
+        return websearch.main(rest)
     if cmd == "set-proxy":
         # 唯一允许启用代理的入口：远程显式指定，固定不切换
         if not rest:
