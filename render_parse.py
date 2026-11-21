@@ -629,6 +629,12 @@ def _build_rec(dom, url, scheme, browser_ch, data, responses, main_resp,
     if err:
         rec["err"] = err
     rec["tags"] = fine_classify.tag(rec)
+    # 源头结构化：抓取落盘时就产出统一四字段卡片，下游可直接读取/调用，
+    try:
+        import enrich_struct as _es
+        rec["ai_struct"] = _es.meta_card(rec)
+    except Exception:
+        pass
     return rec
 
 
@@ -1097,13 +1103,17 @@ def persist(records):
     with open(cr_path, "a", encoding="utf-8") as f:
         for r in fresh:
             t = r.get("tags") or {}
-            f.write(json.dumps({
+            _cr = {
                 "domain": r["domain"], "title": r.get("title", ""),
                 "desc": r.get("desc", ""), "text_len": r.get("text_len", 0),
                 "status": r.get("status", 0), "ok": bool(r.get("ok")),
                 "topics": t.get("topics", []), "forms": t.get("forms", []),
                 "value": t.get("value", ""), "ts": r.get("ts", time.time()),
-            }, ensure_ascii=False) + "\n")
+            }
+            # 源头结构化卡片随记录落盘（增量字段，老记录没有就跳过）
+            if r.get("ai_struct"):
+                _cr["ai_struct"] = r["ai_struct"]
+            f.write(json.dumps(_cr, ensure_ascii=False) + "\n")
     # 发现闭环：新域名 + 真有价值的资源 URL 进队列，供后续批次消费。
     # 🔴 去重：以前每次重解析同一站都会把同样的域名/图标再写一遍，队列会无限膨胀；
     #    fed 表做幂等，且消费端（download_assets.worth）的价值过滤在这里先做一遍，

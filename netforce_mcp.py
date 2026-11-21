@@ -24,7 +24,8 @@ import os
 import subprocess
 import sys
 
-PY = r"G:\Python312\python.exe"
+# 解释器随调用方，避免写死路径后换机/换盘找不到 Python
+PY = sys.executable if sys.executable and os.path.isfile(sys.executable) else "python"
 BASE = r"E:/xmanbian/netforce"
 SKYNET = os.path.join(BASE, "skynet.py")
 CLASSIFY = os.path.join(BASE, "classify.py")
@@ -95,6 +96,19 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "站点 URL，如 https://opengameasset.net/"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "netforce_extract",
+        "description": "爬取并当场抽取：给 URL、要什么字段，直接返回干净结构化 JSON（不再是乱文本）。例：url=https://x.com，fields=title,price,author",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要爬取的页面 URL"},
+                "prompt": {"type": "string", "description": "抽取要求，默认：提取标题和主要内容", "default": "提取标题和主要内容"},
+                "fields": {"type": "string", "description": "字段列表，逗号分隔，如 title,price,author", "default": "title,summary"},
             },
             "required": ["url"],
         },
@@ -207,6 +221,14 @@ def _tool_call(name, args):
         if name == "netforce_structure":
             rc, out, err = _run(["skynet.py", "structure", args.get("url", "")], 240)
             return rc, out, err
+        if name == "netforce_extract":
+            rc, out, err = _run([
+                "ai_extract.py",
+                "--url", args.get("url", ""),
+                "--prompt", args.get("prompt") or "提取标题和主要内容",
+                "--fields", args.get("fields") or "title,summary",
+            ], 240)
+            return rc, out[:MAX_TEXT], err
         if name == "netforce_stats":
             rc, out, err = _run(["skynet.py", "stats"], 120)
             return rc, out, err

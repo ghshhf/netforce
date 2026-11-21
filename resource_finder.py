@@ -1777,17 +1777,83 @@ def main():
     if _fed:
         print("[feed] 启动回灌渲染发现的新域名 %d 个" % len(_fed), flush=True)
     visited = load_visited(seen_dom)      # 断点续爬：重启不重爬（Scrapy JOBDIR 等价）
+
+    # —— 加工层→发现层回灌：把加工层独立发现的域名补回主库，接成闭环 ——
+    # 断点：加工层从 discovered.jsonl 独立长出的 4.6 万域名从不回流主库 resources.json，
+    # 导致主库停在 1.3 万、发现器还会重复发现已加工域名。这里读加工层产物补进
+    # 主库 + seen_dom + visited，一次接成闭环。增量游标落盘，重启不重来。
+    BACKFLOW_STATE = os.path.join(_HERE_DIR, '_kb', 'backflow_state.json')
+
+    def feed_rendered():
+        path = os.path.join(_HERE_DIR, '_kb', 'classified_render.jsonl')
+        if not os.path.exists(path):
+            return 0
+        off = 0
+        try:
+            off = int(json.load(open(BACKFLOW_STATE, encoding='utf-8')).get('off', 0))
+        except Exception:
+            pass
+        size = os.path.getsize(path)
+        if off > size:                     # 文件被轮转/截断 → 游标复位
+            off = 0
+        added = 0
+        try:
+            with open(path, 'rb') as f:
+                f.seek(off)
+                for raw in f:
+                    if not raw.endswith(b'\n'):
+                        break              # 半行留到下次，不推进游标
+                    off += len(raw)
+                    try:
+                        o = json.loads(raw.decode('utf-8'))
+                    except Exception:
+                        continue
+                    d = (o.get('domain') or '').strip().lower()
+                    if not d or '.' not in d or ' ' in d or d in seen_dom:
+                        continue
+                    collected.append({
+                        'url': 'https://' + d + '/', 'domain': d, 'type': 'site',
+                        'found_via': 'render:backflow', 'ok': bool(o.get('ok')),
+                        'noise': bool(NOISE_RE.search(d)),
+                    })
+                    seen_dom.add(d)
+                    visited.add(canon('https://' + d + '/'))  # 不再重复发现已加工域
+                    added += 1
+        except Exception as e:
+            print('[backflow] 回灌异常（不中断）: %s' % str(e)[:80], flush=True)
+        try:
+            json.dump({'off': off, 'ts': time.time()},
+                      open(BACKFLOW_STATE, 'w', encoding='utf-8'))
+        except Exception:
+            pass
+        return added
+
     lock = threading.Lock()               # 并发下保护 queue/visited/collected/落盘
     dom_locks = {}                     # 单域名限流（防把单站打成 WAF 黑名单）
     dirty = {'t': time.time(), 'n': 0}  # 脏标记：定时/定量批量落盘，避免 O(N²) 写盘
 
     def flush_now():
+        # 写盘可能被别的进程短暂占用（诊断脚本、编辑器、杀软扫描）。
+        # 绝不能因为一次 WinError 5 就把常驻爬虫整条带崩 —— 重试几次，
+        # 仍失败就保留 tmp 下一轮再写，主流程照常继续。
         tmp = out + '.tmp'
         with lock:
-            json.dump(collected, open(tmp, 'w', encoding='utf-8'),
-                      ensure_ascii=False, indent=2)
-            os.replace(tmp, out)       # 原子替换，防中断留半截文件
-            dirty['t'], dirty['n'] = time.time(), 0
+            try:
+                with open(tmp, 'w', encoding='utf-8') as _f:
+                    json.dump(collected, _f, ensure_ascii=False, indent=2)
+                for _attempt in range(5):
+                    try:
+                        os.replace(tmp, out)   # 原子替换，防中断留半截文件
+                        break
+                    except PermissionError:
+                        time.sleep(0.4 * (_attempt + 1))
+                else:
+                    print("[flush] 目标被占用，%s 保留待下轮重试" % tmp, flush=True)
+                    return
+                dirty['t'], dirty['n'] = time.time(), 0
+            except Exception as _e:
+                print("[flush] 写盘失败（本轮跳过，不中断）: %s" % str(_e)[:80],
+                      flush=True)
 
     def maybe_flush(_n=None):
         # 每 20 条或每 5 秒落一次盘（崩溃最多丢几秒内的数据，换来数量级的 IO 收益）
@@ -1795,6 +1861,13 @@ def main():
             due = dirty['n'] >= 20 or (time.time() - dirty['t']) >= 5
         if due:
             flush_now()
+
+    # 启动时全量回灌一次：把加工层历史 4.6 万域名一次性补进主库并即时落盘。
+    _bf = feed_rendered()
+    if _bf:
+        flush_now()
+        print("[backflow] 启动全量回灌加工层 %d 个域名（主库累计 %d）"
+              % (_bf, len(collected)), flush=True)
     now = datetime.datetime.now()
     deadline = now.replace(hour=6, minute=0, second=0, microsecond=0)
     if deadline < now:
@@ -2034,8 +2107,21 @@ def main():
     #   原逻辑到早6:00 就退出；现在到点**自动续期到次日**，永远不停。
     #   每轮开始打点播报总入册数 + 队列深度 + 已运行时长，便于随时判断"它还在动没"。
     started = time.time()
+    next_backflow = started + 3600   # 每运行满 1 小时回灌一次加工层新域名（按运行时长，非固定钟点）
     cycles = 0
     while True:
+        # 每小时自动回灌加工层增量：把 render 独立长出的新域名补进主库 + 去重指纹。
+        # 基于运行时长计时（不是某个钟点），爬虫几点启动都照常每小时同步一次。
+        if time.time() >= next_backflow:
+            try:
+                _n = feed_rendered()
+                if _n:
+                    flush_now()
+                    print("[backflow] 运行满 1 小时，增量回灌加工层 %d 个域名（主库 %d）"
+                          % (_n, len(collected)), flush=True)
+            except Exception as _e:
+                print("[backflow] 定时回灌异常（不中断）: %s" % str(_e)[:80], flush=True)
+            next_backflow = time.time() + 3600
         if datetime.datetime.now() >= deadline:
             cycles += 1
             deadline += datetime.timedelta(days=1)
